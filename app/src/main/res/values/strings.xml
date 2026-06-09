@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Compass</string>
+    <string name="app_description">Your private diary</string>
+    <string name="unlock_hint">Long press the compass to unlock</string>
+    <string name="today">Today</string>
+    <string name="write_something">Write anything…</string>
+    <string name="starred_collection">Starred Collection</string>
+    <string name="ai_assistant">AI Assistant</string>
+</resources>

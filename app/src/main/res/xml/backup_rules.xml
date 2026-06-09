@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude the database — data is synced via Google Drive -->
+    <exclude domain="database" path="compass_diary.db" />
+    <!-- Exclude shared preferences that contain sensitive info -->
+    <exclude domain="sharedpref" path="compass_prefs.xml" />
+</full-backup-content>
