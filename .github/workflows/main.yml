@@ -14,6 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fix launcher icon
+        run: |
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#2563C8"
+                  android:pathData="M54,10 A44,44 0 1,0 54,98 A44,44 0 1,0 54,10 Z"/>
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M54,22 L50,54 L54,52 L58,54 Z"/>
+              <path android:fillColor="#EF4444"
+                  android:pathData="M54,86 L50,54 L54,56 L58,54 Z"/>
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M50,50 A4,4 0 1,0 58,50 A4,4 0 1,0 50,50 Z"/>
+          </vector>
+          XMLEOF
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
