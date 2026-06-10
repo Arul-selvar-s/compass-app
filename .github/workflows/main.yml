@@ -59,6 +59,12 @@ jobs:
         with:
           gradle-version: '8.7'
           cache-disabled: true
+          
+      - name: Disable SQLCipher for testing
+        run: |
+          sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' app/src/main/java/com/compass/diary/CompassApplication.kt
+          sed -i 's/val factory = SupportFactory(passphrase)/\/\/ val factory = SupportFactory(passphrase)/' app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt
+          sed -i 's/.openHelperFactory(factory)/\/\/ .openHelperFactory(factory)/' app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt
 
       - name: Build APK
         run: gradle assembleDebug --no-daemon --stacktrace
