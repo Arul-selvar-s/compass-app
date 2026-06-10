@@ -48,7 +48,7 @@ jobs:
           sed -i 's/installSplashScreen()/\/\/ installSplashScreen()/' \
             app/src/main/java/com/compass/diary/MainActivity.kt
 
-          # 4. Disable SQLCipher - use plain Room
+          # 4. Disable SQLCipher
           sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' \
             app/src/main/java/com/compass/diary/CompassApplication.kt
 
@@ -111,26 +111,45 @@ jobs:
           print("Entities fixed")
           PYEOF
 
-          # 6. Fix WelcomeContent - add Get Started button
+          # 6. Rewrite UnlockSetupScreen with working Get Started button
           python3 - << 'PYEOF'
           path = "app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt"
           with open(path) as f:
               content = f.read()
+          # Change step 0 call to pass a lambda directly instead of method reference
           content = content.replace(
               "0 -> WelcomeContent()",
-              "0 -> WelcomeContent(onNext = viewModel::nextStep)"
+              "0 -> WelcomeContent(onNext = { viewModel.finishSetupStep0() })"
           )
+          # Add parameter to WelcomeContent
           content = content.replace(
               "private fun WelcomeContent() {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {",
               "private fun WelcomeContent(onNext: () -> Unit) {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {"
           )
+          # Add button before closing brace of WelcomeContent
           content = content.replace(
               "            }\n        }\n    }\n}\n\n@Composable\nprivate fun FeatureRow",
-              "            }\n        }\n        Spacer(Modifier.height(24.dp))\n        Button(\n            onClick = onNext,\n            modifier = Modifier.fillMaxWidth().height(56.dp),\n            colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)\n        ) { Text(\"Get Started\") }\n    }\n}\n\n@Composable\nprivate fun FeatureRow"
+              "            }\n        }\n        Spacer(androidx.compose.foundation.layout.Modifier.height(24.dp))\n        Button(\n            onClick = onNext,\n            modifier = Modifier.fillMaxWidth().height(56.dp),\n            colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)\n        ) { Text(\"Get Started\") }\n    }\n}\n\n@Composable\nprivate fun FeatureRow"
           )
           with open(path, 'w') as f:
               f.write(content)
-          print("WelcomeContent button added")
+          print("UnlockSetupScreen patched")
+          PYEOF
+
+          # 7. Add finishSetupStep0() function to SetupViewModel
+          python3 - << 'PYEOF'
+          path = "app/src/main/java/com/compass/diary/viewmodel/ViewModels.kt"
+          with open(path) as f:
+              content = f.read()
+          # Add the missing function before finishSecurity
+          if "finishSetupStep0" not in content:
+              content = content.replace(
+                  "    fun finishSecurity() { _step.value = 4 }",
+                  "    fun finishSetupStep0() { _step.value = 1 }\n\n    fun finishSecurity() { _step.value = 4 }"
+              )
+          with open(path, 'w') as f:
+              f.write(content)
+          print("SetupViewModel updated")
           PYEOF
 
           echo "All fixes applied successfully"
