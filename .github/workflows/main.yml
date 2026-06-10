@@ -14,8 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix launcher icon
+      - name: Fix all known runtime crash causes
         run: |
+
+          # 1. Fix launcher icon (remove invalid circle element)
           cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'XMLEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -32,21 +34,84 @@ jobs:
           </vector>
           XMLEOF
 
-      - name: Fix DrawingEntity thumbnail field
-        run: |
+          # 2. Fix themes.xml - wrong parent crashes app on Android < 12
+          cat > app/src/main/res/values/themes.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Compass" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          XMLEOF
+
+          # 3. Remove installSplashScreen() - requires Theme.SplashScreen parent
+          sed -i 's/installSplashScreen()/\/\/ installSplashScreen()/' \
+            app/src/main/java/com/compass/diary/MainActivity.kt
+
+          # 4. Disable SQLCipher - use plain Room instead (safer for testing)
+          sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' \
+            app/src/main/java/com/compass/diary/CompassApplication.kt
+
+          cat > app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt << 'KTEOF'
+          package com.compass.diary.data.local.database
+
+          import androidx.room.Database
+          import androidx.room.Room
+          import androidx.room.RoomDatabase
+          import android.content.Context
+          import com.compass.diary.data.local.dao.*
+          import com.compass.diary.data.local.entity.*
+
+          @Database(
+              entities = [
+                  DiaryEntryEntity::class,
+                  StarredItemEntity::class,
+                  ReminderEntity::class,
+                  VersionHistoryEntity::class,
+                  SharedPageEntity::class,
+                  DrawingEntity::class,
+                  VoiceNoteEntity::class
+              ],
+              version = 1,
+              exportSchema = false
+          )
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun diaryDao(): DiaryDao
+              abstract fun starredDao(): StarredDao
+              abstract fun reminderDao(): ReminderDao
+              abstract fun versionHistoryDao(): VersionHistoryDao
+              abstract fun drawingDao(): DrawingDao
+              abstract fun voiceNoteDao(): VoiceNoteDao
+
+              companion object {
+                  fun create(context: Context, passphrase: ByteArray): AppDatabase {
+                      return Room.databaseBuilder(
+                          context.applicationContext,
+                          AppDatabase::class.java,
+                          "compass_diary.db"
+                      )
+                      .fallbackToDestructiveMigration()
+                      .build()
+                  }
+              }
+          }
+          KTEOF
+
+          # 5. Fix Entities - remove thumbnail field that breaks Room KSP
           python3 - << 'PYEOF'
           import re
           path = "app/src/main/java/com/compass/diary/data/local/entity/Entities.kt"
           with open(path) as f:
               content = f.read()
-          # Remove the thumbnail field (with or without @Ignore annotation)
-          content = re.sub(r'\s*@androidx\.room\.Ignore\s+val thumbnail.*\n', '\n', content)
-          content = re.sub(r'\s*@Ignore\s+val thumbnail.*\n', '\n', content)
-          content = re.sub(r'\s*val thumbnail: ByteArray\?.*\n', '\n', content)
+          content = re.sub(r'\s*@androidx\.room\.Ignore\s+val thumbnail[^\n]*\n', '\n', content)
+          content = re.sub(r'\s*@Ignore\s+val thumbnail[^\n]*\n', '\n', content)
+          content = re.sub(r'\s*val thumbnail: ByteArray\?[^\n]*\n', '\n', content)
           with open(path, 'w') as f:
               f.write(content)
-          print("Entities.kt fixed")
+          print("Entities fixed")
           PYEOF
+
+          echo "All fixes applied"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -59,12 +124,6 @@ jobs:
         with:
           gradle-version: '8.7'
           cache-disabled: true
-          
-      - name: Disable SQLCipher for testing
-        run: |
-          sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' app/src/main/java/com/compass/diary/CompassApplication.kt
-          sed -i 's/val factory = SupportFactory(passphrase)/\/\/ val factory = SupportFactory(passphrase)/' app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt
-          sed -i 's/.openHelperFactory(factory)/\/\/ .openHelperFactory(factory)/' app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt
 
       - name: Build APK
         run: gradle assembleDebug --no-daemon --stacktrace
