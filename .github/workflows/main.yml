@@ -17,7 +17,7 @@ jobs:
       - name: Fix all known runtime crash causes
         run: |
 
-          # 1. Fix launcher icon (remove invalid circle element)
+          # 1. Fix launcher icon
           cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'XMLEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -34,7 +34,7 @@ jobs:
           </vector>
           XMLEOF
 
-          # 2. Fix themes.xml - wrong parent crashes app on Android < 12
+          # 2. Fix themes.xml
           cat > app/src/main/res/values/themes.xml << 'XMLEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
@@ -44,11 +44,11 @@ jobs:
           </resources>
           XMLEOF
 
-          # 3. Remove installSplashScreen() - requires Theme.SplashScreen parent
+          # 3. Remove installSplashScreen()
           sed -i 's/installSplashScreen()/\/\/ installSplashScreen()/' \
             app/src/main/java/com/compass/diary/MainActivity.kt
 
-          # 4. Disable SQLCipher - use plain Room instead (safer for testing)
+          # 4. Disable SQLCipher - use plain Room
           sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' \
             app/src/main/java/com/compass/diary/CompassApplication.kt
 
@@ -97,7 +97,7 @@ jobs:
           }
           KTEOF
 
-          # 5. Fix Entities - remove thumbnail field that breaks Room KSP
+          # 5. Fix Entities - remove thumbnail field
           python3 - << 'PYEOF'
           import re
           path = "app/src/main/java/com/compass/diary/data/local/entity/Entities.kt"
@@ -111,7 +111,29 @@ jobs:
           print("Entities fixed")
           PYEOF
 
-          echo "All fixes applied"
+          # 6. Fix WelcomeContent - add Get Started button
+          python3 - << 'PYEOF'
+          path = "app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt"
+          with open(path) as f:
+              content = f.read()
+          content = content.replace(
+              "0 -> WelcomeContent()",
+              "0 -> WelcomeContent(onNext = viewModel::nextStep)"
+          )
+          content = content.replace(
+              "private fun WelcomeContent() {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {",
+              "private fun WelcomeContent(onNext: () -> Unit) {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {"
+          )
+          content = content.replace(
+              "            }\n        }\n    }\n}\n\n@Composable\nprivate fun FeatureRow",
+              "            }\n        }\n        Spacer(Modifier.height(24.dp))\n        Button(\n            onClick = onNext,\n            modifier = Modifier.fillMaxWidth().height(56.dp),\n            colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)\n        ) { Text(\"Get Started\") }\n    }\n}\n\n@Composable\nprivate fun FeatureRow"
+          )
+          with open(path, 'w') as f:
+              f.write(content)
+          print("WelcomeContent button added")
+          PYEOF
+
+          echo "All fixes applied successfully"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
