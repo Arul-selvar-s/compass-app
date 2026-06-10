@@ -19,10 +19,8 @@ jobs:
           cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'XMLEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp"
-              android:height="108dp"
-              android:viewportWidth="108"
-              android:viewportHeight="108">
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
               <path android:fillColor="#2563C8"
                   android:pathData="M54,10 A44,44 0 1,0 54,98 A44,44 0 1,0 54,10 Z"/>
               <path android:fillColor="#FFFFFF"
@@ -33,6 +31,22 @@ jobs:
                   android:pathData="M50,50 A4,4 0 1,0 58,50 A4,4 0 1,0 50,50 Z"/>
           </vector>
           XMLEOF
+
+      - name: Fix DrawingEntity thumbnail field
+        run: |
+          python3 - << 'PYEOF'
+          import re
+          path = "app/src/main/java/com/compass/diary/data/local/entity/Entities.kt"
+          with open(path) as f:
+              content = f.read()
+          # Remove the thumbnail field (with or without @Ignore annotation)
+          content = re.sub(r'\s*@androidx\.room\.Ignore\s+val thumbnail.*\n', '\n', content)
+          content = re.sub(r'\s*@Ignore\s+val thumbnail.*\n', '\n', content)
+          content = re.sub(r'\s*val thumbnail: ByteArray\?.*\n', '\n', content)
+          with open(path, 'w') as f:
+              f.write(content)
+          print("Entities.kt fixed")
+          PYEOF
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
