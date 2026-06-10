@@ -14,37 +14,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix all known runtime crash causes
+      - name: Fix all known issues
         run: |
 
           # 1. Fix launcher icon
-          cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'XMLEOF'
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp" android:height="108dp"
               android:viewportWidth="108" android:viewportHeight="108">
-              <path android:fillColor="#2563C8"
-                  android:pathData="M54,10 A44,44 0 1,0 54,98 A44,44 0 1,0 54,10 Z"/>
-              <path android:fillColor="#FFFFFF"
-                  android:pathData="M54,22 L50,54 L54,52 L58,54 Z"/>
-              <path android:fillColor="#EF4444"
-                  android:pathData="M54,86 L50,54 L54,56 L58,54 Z"/>
-              <path android:fillColor="#FFFFFF"
-                  android:pathData="M50,50 A4,4 0 1,0 58,50 A4,4 0 1,0 50,50 Z"/>
+              <path android:fillColor="#2563C8" android:pathData="M54,10 A44,44 0 1,0 54,98 A44,44 0 1,0 54,10 Z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M54,22 L50,54 L54,52 L58,54 Z"/>
+              <path android:fillColor="#EF4444" android:pathData="M54,86 L50,54 L54,56 L58,54 Z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M50,50 A4,4 0 1,0 58,50 A4,4 0 1,0 50,50 Z"/>
           </vector>
-          XMLEOF
+          EOF
 
           # 2. Fix themes.xml
-          cat > app/src/main/res/values/themes.xml << 'XMLEOF'
+          cat > app/src/main/res/values/themes.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="Theme.Compass" parent="android:Theme.Material.Light.NoActionBar">
                   <item name="android:windowBackground">@android:color/black</item>
               </style>
           </resources>
-          XMLEOF
+          EOF
 
-          # 3. Remove installSplashScreen()
+          # 3. Remove installSplashScreen
           sed -i 's/installSplashScreen()/\/\/ installSplashScreen()/' \
             app/src/main/java/com/compass/diary/MainActivity.kt
 
@@ -52,29 +48,16 @@ jobs:
           sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' \
             app/src/main/java/com/compass/diary/CompassApplication.kt
 
-          cat > app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt << 'KTEOF'
+          # 5. Fix AppDatabase - no SQLCipher
+          cat > app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt << 'EOF'
           package com.compass.diary.data.local.database
-
           import androidx.room.Database
           import androidx.room.Room
           import androidx.room.RoomDatabase
           import android.content.Context
           import com.compass.diary.data.local.dao.*
           import com.compass.diary.data.local.entity.*
-
-          @Database(
-              entities = [
-                  DiaryEntryEntity::class,
-                  StarredItemEntity::class,
-                  ReminderEntity::class,
-                  VersionHistoryEntity::class,
-                  SharedPageEntity::class,
-                  DrawingEntity::class,
-                  VoiceNoteEntity::class
-              ],
-              version = 1,
-              exportSchema = false
-          )
+          @Database(entities=[DiaryEntryEntity::class,StarredItemEntity::class,ReminderEntity::class,VersionHistoryEntity::class,SharedPageEntity::class,DrawingEntity::class,VoiceNoteEntity::class],version=1,exportSchema=false)
           abstract class AppDatabase : RoomDatabase() {
               abstract fun diaryDao(): DiaryDao
               abstract fun starredDao(): StarredDao
@@ -82,77 +65,231 @@ jobs:
               abstract fun versionHistoryDao(): VersionHistoryDao
               abstract fun drawingDao(): DrawingDao
               abstract fun voiceNoteDao(): VoiceNoteDao
-
               companion object {
                   fun create(context: Context, passphrase: ByteArray): AppDatabase {
-                      return Room.databaseBuilder(
-                          context.applicationContext,
-                          AppDatabase::class.java,
-                          "compass_diary.db"
-                      )
-                      .fallbackToDestructiveMigration()
-                      .build()
+                      return Room.databaseBuilder(context.applicationContext,AppDatabase::class.java,"compass_diary.db").fallbackToDestructiveMigration().build()
                   }
               }
           }
-          KTEOF
+          EOF
 
-          # 5. Fix Entities - remove thumbnail field
+          # 6. Fix Entities - remove thumbnail field
           python3 - << 'PYEOF'
           import re
           path = "app/src/main/java/com/compass/diary/data/local/entity/Entities.kt"
           with open(path) as f:
               content = f.read()
-          content = re.sub(r'\s*@androidx\.room\.Ignore\s+val thumbnail[^\n]*\n', '\n', content)
-          content = re.sub(r'\s*@Ignore\s+val thumbnail[^\n]*\n', '\n', content)
-          content = re.sub(r'\s*val thumbnail: ByteArray\?[^\n]*\n', '\n', content)
+          content = re.sub(r'[^\n]*thumbnail[^\n]*\n', '', content)
           with open(path, 'w') as f:
               f.write(content)
           print("Entities fixed")
           PYEOF
 
-          # 6. Rewrite UnlockSetupScreen with working Get Started button
-          python3 - << 'PYEOF'
-          path = "app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt"
-          with open(path) as f:
-              content = f.read()
-          # Change step 0 call to pass a lambda directly instead of method reference
-          content = content.replace(
-              "0 -> WelcomeContent()",
-              "0 -> WelcomeContent(onNext = { viewModel.finishSetupStep0() })"
-          )
-          # Add parameter to WelcomeContent
-          content = content.replace(
-              "private fun WelcomeContent() {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {",
-              "private fun WelcomeContent(onNext: () -> Unit) {\n    Column(horizontalAlignment = Alignment.CenterHorizontally) {"
-          )
-          # Add button before closing brace of WelcomeContent
-          content = content.replace(
-              "            }\n        }\n    }\n}\n\n@Composable\nprivate fun FeatureRow",
-              "            }\n        }\n        Spacer(androidx.compose.foundation.layout.Modifier.height(24.dp))\n        Button(\n            onClick = onNext,\n            modifier = Modifier.fillMaxWidth().height(56.dp),\n            colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)\n        ) { Text(\"Get Started\") }\n    }\n}\n\n@Composable\nprivate fun FeatureRow"
-          )
-          with open(path, 'w') as f:
-              f.write(content)
-          print("UnlockSetupScreen patched")
-          PYEOF
+          # 7. Completely rewrite UnlockSetupScreen with working Get Started button
+          cat > app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt << 'EOF'
+          package com.compass.diary.ui.screens.unlock
 
-          # 7. Add finishSetupStep0() function to SetupViewModel
+          import androidx.compose.animation.AnimatedContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.hilt.navigation.compose.hiltViewModel
+          import com.compass.diary.ui.theme.CompassColors
+          import com.compass.diary.viewmodel.SetupViewModel
+
+          @Composable
+          fun UnlockSetupScreen(
+              onSetupComplete: () -> Unit,
+              viewModel: SetupViewModel = hiltViewModel()
+          ) {
+              val step by viewModel.step.collectAsState()
+              val heading by viewModel.heading.collectAsState()
+              val savedAngle1 by viewModel.savedAngle1.collectAsState()
+
+              Box(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Brush.verticalGradient(listOf(Color(0xFF060C1A), Color(0xFF0D2047))))
+              ) {
+                  Column(
+                      modifier = Modifier.fillMaxSize().padding(24.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Spacer(Modifier.height(60.dp))
+                      StepDots(step = step, total = 4)
+                      Spacer(Modifier.height(40.dp))
+
+                      AnimatedContent(targetState = step, label = "step") { s ->
+                          when (s) {
+                              0 -> StepWelcome(onNext = { viewModel.goToStep(1) })
+                              1 -> StepDirection(
+                                  title = "Create Your Lock",
+                                  subtitle = "Point to your FIRST secret direction then tap Lock It",
+                                  heading = heading,
+                                  onConfirm = { viewModel.saveAngle1(heading) }
+                              )
+                              2 -> StepDirection(
+                                  title = "Second Direction",
+                                  subtitle = "Point to your SECOND secret direction then tap Lock It",
+                                  heading = heading,
+                                  savedAngle = savedAngle1,
+                                  onConfirm = { viewModel.saveAngle2(heading) }
+                              )
+                              3 -> StepDone(onFinish = {
+                                  viewModel.completeSetup()
+                                  onSetupComplete()
+                              })
+                              else -> StepWelcome(onNext = { viewModel.goToStep(1) })
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun StepDots(step: Int, total: Int) {
+              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                  repeat(total) { i ->
+                      Box(
+                          modifier = Modifier
+                              .size(if (i == step) 24.dp else 8.dp, 8.dp)
+                              .background(
+                                  if (i <= step) CompassColors.Blue400 else CompassColors.Silver700,
+                                  CircleShape
+                              )
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun StepWelcome(onNext: () -> Unit) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("🧭", fontSize = 80.sp)
+                  Spacer(Modifier.height(24.dp))
+                  Text("Welcome to Compass", style = MaterialTheme.typography.headlineMedium,
+                      fontWeight = FontWeight.Bold, color = CompassColors.White,
+                      textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(12.dp))
+                  Text("Your private diary hidden in plain sight",
+                      style = MaterialTheme.typography.bodyLarge,
+                      color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(32.dp))
+                  Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0D2047)),
+                      modifier = Modifier.fillMaxWidth()) {
+                      Column(modifier = Modifier.padding(20.dp)) {
+                          listOf("🔒 Hidden behind a compass","✨ Unlimited daily pages",
+                              "🤖 AI-powered search","🎨 Rich text and drawing").forEach {
+                              Text(it, style = MaterialTheme.typography.bodyMedium,
+                                  color = CompassColors.Silver200,
+                                  modifier = Modifier.padding(vertical = 4.dp))
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(32.dp))
+                  Button(onClick = onNext,
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) {
+                      Text("Get Started", style = MaterialTheme.typography.titleMedium)
+                  }
+              }
+          }
+
+          @Composable
+          private fun StepDirection(
+              title: String,
+              subtitle: String,
+              heading: Float,
+              savedAngle: Float? = null,
+              onConfirm: () -> Unit
+          ) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(title, style = MaterialTheme.typography.headlineMedium,
+                      fontWeight = FontWeight.Bold, color = CompassColors.White,
+                      textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(12.dp))
+                  Text(subtitle, style = MaterialTheme.typography.bodyLarge,
+                      color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(48.dp))
+                  Text("${heading.toInt()}°",
+                      style = MaterialTheme.typography.displayMedium,
+                      fontWeight = FontWeight.Bold, color = CompassColors.Blue300)
+                  Text(headingToCardinal(heading),
+                      style = MaterialTheme.typography.titleLarge, color = CompassColors.Silver400)
+                  savedAngle?.let {
+                      Spacer(Modifier.height(8.dp))
+                      Text("First direction saved: ${it.toInt()}°",
+                          style = MaterialTheme.typography.bodySmall, color = CompassColors.Gold400)
+                  }
+                  Spacer(Modifier.height(48.dp))
+                  Button(onClick = onConfirm,
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) {
+                      Text("Lock This Direction")
+                  }
+              }
+          }
+
+          @Composable
+          private fun StepDone(onFinish: () -> Unit) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("✅", fontSize = 80.sp)
+                  Spacer(Modifier.height(24.dp))
+                  Text("Compass Lock Set!", style = MaterialTheme.typography.headlineMedium,
+                      fontWeight = FontWeight.Bold, color = CompassColors.White,
+                      textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(12.dp))
+                  Text("Long-press the compass center to unlock your diary",
+                      style = MaterialTheme.typography.bodyLarge,
+                      color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(48.dp))
+                  Button(onClick = onFinish,
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) {
+                      Text("Open My Diary")
+                  }
+              }
+          }
+
+          private fun headingToCardinal(h: Float) = when (h) {
+              in 337.5f..360f, in 0f..22.5f -> "North"
+              in 22.5f..67.5f -> "North-East"
+              in 67.5f..112.5f -> "East"
+              in 112.5f..157.5f -> "South-East"
+              in 157.5f..202.5f -> "South"
+              in 202.5f..247.5f -> "South-West"
+              in 247.5f..292.5f -> "West"
+              else -> "North-West"
+          }
+          EOF
+
+          # 8. Add goToStep function to SetupViewModel
           python3 - << 'PYEOF'
           path = "app/src/main/java/com/compass/diary/viewmodel/ViewModels.kt"
           with open(path) as f:
               content = f.read()
-          # Add the missing function before finishSecurity
-          if "finishSetupStep0" not in content:
+          if "fun goToStep" not in content:
               content = content.replace(
-                  "    fun finishSecurity() { _step.value = 4 }",
-                  "    fun finishSetupStep0() { _step.value = 1 }\n\n    fun finishSecurity() { _step.value = 4 }"
+                  "    fun saveAngle1(",
+                  "    fun goToStep(s: Int) { _step.value = s }\n\n    fun saveAngle1("
               )
           with open(path, 'w') as f:
               f.write(content)
-          print("SetupViewModel updated")
+          print("ViewModels updated")
           PYEOF
 
-          echo "All fixes applied successfully"
+          echo "All fixes applied"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
