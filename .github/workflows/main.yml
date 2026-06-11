@@ -40,40 +40,34 @@ jobs:
           </resources>
           EOF
 
-          # 3. Remove installSplashScreen
+          # 3. Patch MainActivity
           sed -i 's/installSplashScreen()/\/\/ installSplashScreen()/' \
             app/src/main/java/com/compass/diary/MainActivity.kt
 
-          # 4. Disable SQLCipher
+          # 4. Patch Application
           sed -i 's/SQLiteDatabase.loadLibs(this)/\/\/ SQLiteDatabase.loadLibs(this)/' \
             app/src/main/java/com/compass/diary/CompassApplication.kt
 
-          # 5. Fix AppDatabase (no SQLCipher)
+          # 5. Fix AppDatabase
           cat > app/src/main/java/com/compass/diary/data/local/database/AppDatabase.kt << 'EOF'
           package com.compass.diary.data.local.database
-          import androidx.room.Database
-          import androidx.room.Room
-          import androidx.room.RoomDatabase
+          import androidx.room.Database; import androidx.room.Room; import androidx.room.RoomDatabase
           import android.content.Context
-          import com.compass.diary.data.local.dao.*
-          import com.compass.diary.data.local.entity.*
+          import com.compass.diary.data.local.dao.*; import com.compass.diary.data.local.entity.*
           @Database(entities=[DiaryEntryEntity::class,StarredItemEntity::class,ReminderEntity::class,VersionHistoryEntity::class,SharedPageEntity::class,DrawingEntity::class,VoiceNoteEntity::class],version=1,exportSchema=false)
           abstract class AppDatabase : RoomDatabase() {
-              abstract fun diaryDao(): DiaryDao
-              abstract fun starredDao(): StarredDao
-              abstract fun reminderDao(): ReminderDao
-              abstract fun versionHistoryDao(): VersionHistoryDao
-              abstract fun drawingDao(): DrawingDao
-              abstract fun voiceNoteDao(): VoiceNoteDao
+              abstract fun diaryDao(): DiaryDao; abstract fun starredDao(): StarredDao
+              abstract fun reminderDao(): ReminderDao; abstract fun versionHistoryDao(): VersionHistoryDao
+              abstract fun drawingDao(): DrawingDao; abstract fun voiceNoteDao(): VoiceNoteDao
               companion object {
-                  fun create(context: Context, passphrase: ByteArray): AppDatabase {
-                      return Room.databaseBuilder(context.applicationContext,AppDatabase::class.java,"compass_diary.db").fallbackToDestructiveMigration().build()
-                  }
+                  fun create(context: Context, passphrase: ByteArray): AppDatabase =
+                      Room.databaseBuilder(context.applicationContext,AppDatabase::class.java,"compass_diary.db")
+                          .fallbackToDestructiveMigration().build()
               }
           }
           EOF
 
-          # 6. Fix Entities
+          # 6. Fix Entities (remove thumbnail)
           python3 - << 'PYEOF'
           import re
           path = "app/src/main/java/com/compass/diary/data/local/entity/Entities.kt"
@@ -85,23 +79,138 @@ jobs:
           print("Entities fixed")
           PYEOF
 
-          # 7. ViewModels.kt (with saveAngle1 fix)
+          # 7. FIX ROOT SAVE BUG: DiaryRepository - ensure entry exists before saving
+          cat > app/src/main/java/com/compass/diary/data/repository/DiaryRepository.kt << 'EOF'
+          package com.compass.diary.data.repository
+          import com.compass.diary.data.local.dao.*
+          import com.compass.diary.data.local.entity.*
+          import kotlinx.coroutines.flow.Flow
+          import java.time.LocalDate; import java.time.format.TextStyle; import java.util.Locale
+          import javax.inject.Inject; import javax.inject.Singleton
+
+          @Singleton
+          class DiaryRepository @Inject constructor(
+              private val diaryDao: DiaryDao, private val starredDao: StarredDao,
+              private val reminderDao: ReminderDao, private val versionHistoryDao: VersionHistoryDao,
+              private val drawingDao: DrawingDao, private val voiceNoteDao: VoiceNoteDao
+          ) {
+              fun getAllEntries(): Flow<List<DiaryEntryEntity>> = diaryDao.getAllEntries()
+              fun getEntryByDate(dateKey: String): Flow<DiaryEntryEntity?> = diaryDao.getEntryByDate(dateKey)
+              fun getAllDateKeys(): Flow<List<String>> = diaryDao.getAllDateKeys()
+
+              suspend fun getEntryByDateOnce(dateKey: String): DiaryEntryEntity? =
+                  diaryDao.getEntryByDateOnce(dateKey)
+
+              suspend fun upsertEntry(entry: DiaryEntryEntity) = diaryDao.upsertEntry(entry)
+
+              /** Ensures a row exists for any date before saving. Fixes silent UPDATE failure. */
+              suspend fun ensureEntry(dateKey: String) {
+                  if (diaryDao.getEntryByDateOnce(dateKey) == null) {
+                      val date = runCatching { LocalDate.parse(dateKey) }.getOrDefault(LocalDate.now())
+                      diaryDao.upsertEntry(DiaryEntryEntity(dateKey = dateKey, title = buildTitle(date)))
+                  }
+              }
+
+              suspend fun getOrCreateTodayEntry(): DiaryEntryEntity {
+                  val key = LocalDate.now().toString()
+                  ensureEntry(key)
+                  return diaryDao.getEntryByDateOnce(key)!!
+              }
+
+              suspend fun saveContent(dateKey: String, contentJson: String, plainText: String) {
+                  ensureEntry(dateKey)   // <-- THE KEY FIX: guarantees the row exists
+                  val wc = plainText.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+                  diaryDao.updateContent(dateKey, contentJson, plainText, wc)
+                  versionHistoryDao.insertVersion(VersionHistoryEntity(
+                      diaryDateKey = dateKey, contentJson = contentJson, plainText = plainText, wordCount = wc
+                  ))
+                  if (versionHistoryDao.countVersions(dateKey) > 100)
+                      versionHistoryDao.pruneOldVersions(dateKey, System.currentTimeMillis() - 30L*24*3600*1000)
+              }
+
+              suspend fun searchEntries(query: String) = diaryDao.searchEntries(query)
+              suspend fun getEntriesInRange(from: String, to: String) = diaryDao.getEntriesInRange(from, to)
+              suspend fun softDeleteEntry(dateKey: String) = diaryDao.softDelete(dateKey)
+              suspend fun getUnsyncedEntries() = diaryDao.getUnsyncedEntries()
+              suspend fun markEntrySynced(dateKey: String, cloudId: String) = diaryDao.markSynced(dateKey, cloudId)
+
+              fun getVersionHistory(dateKey: String) = versionHistoryDao.getHistoryForDate(dateKey)
+              suspend fun getVersionHistoryLimited(dateKey: String, limit: Int = 30) =
+                  versionHistoryDao.getHistoryForDateLimited(dateKey, limit)
+              suspend fun restoreVersion(dateKey: String, version: VersionHistoryEntity) {
+                  diaryDao.updateContent(dateKey, version.contentJson, version.plainText, version.wordCount)
+              }
+
+              fun getAllStarred() = starredDao.getAllStarred()
+              fun getStarredForDate(dateKey: String) = starredDao.getStarredForDate(dateKey)
+              suspend fun addStarred(item: StarredItemEntity): Long = starredDao.insertStarred(item)
+              suspend fun removeStarred(id: Long) = starredDao.deleteStarredById(id)
+              suspend fun searchStarred(query: String) = starredDao.searchStarred(query)
+
+              fun getAllReminders() = reminderDao.getAllReminders()
+              fun getUpcomingReminders() = reminderDao.getUpcomingReminders()
+              fun getCompletedReminders() = reminderDao.getCompletedReminders()
+              suspend fun upsertReminder(r: ReminderEntity): Long = reminderDao.upsertReminder(r)
+              suspend fun deleteReminder(r: ReminderEntity) = reminderDao.deleteReminder(r)
+              suspend fun markReminderCompleted(id: Long) = reminderDao.markCompleted(id)
+              suspend fun getReminderById(id: Long) = reminderDao.getReminderById(id)
+
+              fun getDrawings(dateKey: String) = drawingDao.getDrawingsForDate(dateKey)
+              suspend fun saveDrawing(d: DrawingEntity): Long = drawingDao.upsertDrawing(d)
+              suspend fun deleteDrawing(d: DrawingEntity) = drawingDao.deleteDrawing(d)
+
+              fun getVoiceNotes(dateKey: String) = voiceNoteDao.getVoiceNotesForDate(dateKey)
+              suspend fun saveVoiceNote(n: VoiceNoteEntity): Long = voiceNoteDao.upsertVoiceNote(n)
+              suspend fun deleteVoiceNote(n: VoiceNoteEntity) = voiceNoteDao.deleteVoiceNote(n)
+              suspend fun searchTranscripts(query: String) = voiceNoteDao.searchTranscripts(query)
+
+              private fun buildTitle(date: LocalDate): String {
+                  val dow   = date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.getDefault())
+                  val month = date.month.getDisplayName(TextStyle.FULL, Locale.getDefault())
+                  return "$dow, $month ${date.dayOfMonth}, ${date.year}"
+              }
+          }
+          EOF
+
+          # 8. Fix DiaryViewModel - selectEntry now calls ensureEntry
+          python3 - << 'PYEOF'
+          path = "app/src/main/java/com/compass/diary/viewmodel/DiaryViewModel.kt"
+          with open(path) as f:
+              content = f.read()
+          # Fix selectEntry - was calling getOrCreateTodayEntry which only creates today
+          old = "    fun selectEntry(dateKey: String) {\n        _selectedDateKey.value = dateKey\n        viewModelScope.launch { repo.getOrCreateTodayEntry() }\n    }"
+          new = """    fun selectEntry(dateKey: String) {
+              _selectedDateKey.value = dateKey
+              viewModelScope.launch { repo.ensureEntry(dateKey) }
+          }"""
+          if old in content:
+              content = content.replace(old, new)
+              print("selectEntry fixed")
+          else:
+              # Try alternate whitespace
+              import re
+              content = re.sub(
+                  r'fun selectEntry\(dateKey: String\) \{[^}]+\}',
+                  'fun selectEntry(dateKey: String) {\n        _selectedDateKey.value = dateKey\n        viewModelScope.launch { repo.ensureEntry(dateKey) }\n    }',
+                  content
+              )
+              print("selectEntry fixed (regex)")
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+
+          # 9. ViewModels.kt - add saveGoogleAccount to SetupViewModel
           cat > app/src/main/java/com/compass/diary/viewmodel/ViewModels.kt << 'EOF'
           package com.compass.diary.viewmodel
-
           import android.content.Context
           import androidx.biometric.BiometricManager
-          import androidx.lifecycle.ViewModel
-          import androidx.lifecycle.viewModelScope
+          import androidx.lifecycle.ViewModel; import androidx.lifecycle.viewModelScope
           import com.compass.diary.data.repository.DiaryRepository
-          import com.compass.diary.util.CompassSensorManager
-          import com.compass.diary.util.PreferencesManager
+          import com.compass.diary.util.CompassSensorManager; import com.compass.diary.util.PreferencesManager
           import dagger.hilt.android.lifecycle.HiltViewModel
           import dagger.hilt.android.qualifiers.ApplicationContext
-          import kotlinx.coroutines.flow.*
-          import kotlinx.coroutines.launch
-          import java.text.SimpleDateFormat
-          import java.util.*
+          import kotlinx.coroutines.flow.*; import kotlinx.coroutines.launch
+          import java.text.SimpleDateFormat; import java.util.*
           import javax.inject.Inject
 
           @HiltViewModel
@@ -125,11 +234,9 @@ jobs:
                   viewModelScope.launch { prefs.setUnlockAngles(angle, angle) }
                   _step.value = 2
               }
+              fun saveGoogleAccount(email: String) { viewModelScope.launch { prefs.setGoogleAccount(email) } }
               fun setBiometric(v: Boolean) { viewModelScope.launch { prefs.setBiometricEnabled(v) } }
-              fun finishSecurity() { _step.value = 4 }
-              fun completeSetup() {
-                  viewModelScope.launch { prefs.setSetupComplete(true); prefs.setFirstLaunch(false) }
-              }
+              fun completeSetup() { viewModelScope.launch { prefs.setSetupComplete(true); prefs.setFirstLaunch(false) } }
           }
 
           @HiltViewModel
@@ -140,8 +247,7 @@ jobs:
 
           @HiltViewModel
           class SettingsViewModel @Inject constructor(
-              private val prefs: PreferencesManager,
-              private val repo: DiaryRepository
+              private val prefs: PreferencesManager, private val repo: DiaryRepository
           ) : ViewModel() {
               val darkMode: StateFlow<String> = prefs.darkMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "SYSTEM")
               val notificationsEnabled: StateFlow<Boolean> = prefs.isNotificationsEnabled.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
@@ -149,8 +255,7 @@ jobs:
               val googleAccount: StateFlow<String?> = prefs.googleAccount.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
               val biometricEnabled: StateFlow<Boolean> = prefs.isBiometricEnabled.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
               val anthropicApiKey: StateFlow<String?> = prefs.anthropicApiKey.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
-              private val _lastSyncLabel = MutableStateFlow("Never")
-              val lastSyncLabel: StateFlow<String> = _lastSyncLabel
+              private val _lastSyncLabel = MutableStateFlow("Never"); val lastSyncLabel: StateFlow<String> = _lastSyncLabel
               fun setDarkMode(m: String) { viewModelScope.launch { prefs.setDarkMode(m) } }
               fun setNotifications(v: Boolean) { viewModelScope.launch { prefs.setNotificationsEnabled(v) } }
               fun setAutoSync(v: Boolean) { viewModelScope.launch { prefs.setAutoSync(v) } }
@@ -162,22 +267,17 @@ jobs:
           }
           EOF
 
-          # 8. CompassViewModel
+          # 10. CompassViewModel
           cat > app/src/main/java/com/compass/diary/viewmodel/CompassViewModel.kt << 'EOF'
           package com.compass.diary.viewmodel
-          import androidx.lifecycle.ViewModel
-          import androidx.lifecycle.viewModelScope
-          import com.compass.diary.util.CompassSensorManager
-          import com.compass.diary.util.PreferencesManager
+          import androidx.lifecycle.ViewModel; import androidx.lifecycle.viewModelScope
+          import com.compass.diary.util.CompassSensorManager; import com.compass.diary.util.PreferencesManager
           import dagger.hilt.android.lifecycle.HiltViewModel
-          import kotlinx.coroutines.flow.*
-          import kotlinx.coroutines.launch
-          import javax.inject.Inject
-          import kotlin.math.abs
+          import kotlinx.coroutines.flow.*; import kotlinx.coroutines.launch
+          import javax.inject.Inject; import kotlin.math.abs
           @HiltViewModel
           class CompassViewModel @Inject constructor(
-              private val sensorManager: CompassSensorManager,
-              private val prefs: PreferencesManager
+              private val sensorManager: CompassSensorManager, private val prefs: PreferencesManager
           ) : ViewModel() {
               data class UnlockAction(val targetAngle: Float, val isCorrect: Boolean)
               val heading: StateFlow<Float> = sensorManager.headingFlow()
@@ -194,32 +294,22 @@ jobs:
           }
           EOF
 
-          # 9. CompassScreen
+          # 11. CompassScreen
           cat > app/src/main/java/com/compass/diary/ui/screens/compass/CompassScreen.kt << 'EOF'
           package com.compass.diary.ui.screens.compass
           import androidx.compose.animation.core.*
-          import androidx.compose.foundation.Canvas
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.Canvas; import androidx.compose.foundation.background; import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.text.KeyboardOptions
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.geometry.Offset
-          import androidx.compose.ui.graphics.*
-          import androidx.compose.ui.graphics.drawscope.Stroke
-          import androidx.compose.ui.graphics.drawscope.rotate
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.text.input.KeyboardType
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.Alignment; import androidx.compose.ui.Modifier
+          import androidx.compose.ui.geometry.Offset; import androidx.compose.ui.graphics.*
+          import androidx.compose.ui.graphics.drawscope.Stroke; import androidx.compose.ui.graphics.drawscope.rotate
+          import androidx.compose.ui.text.font.FontWeight; import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp; import androidx.compose.ui.unit.sp
           import androidx.hilt.navigation.compose.hiltViewModel
-          import com.compass.diary.ui.theme.CompassColors
-          import com.compass.diary.viewmodel.CompassViewModel
-          import kotlinx.coroutines.delay
-          import kotlin.math.sin
-          import kotlin.math.cos
+          import com.compass.diary.ui.theme.CompassColors; import com.compass.diary.viewmodel.CompassViewModel
+          import kotlinx.coroutines.delay; import kotlin.math.sin; import kotlin.math.cos
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun CompassScreen(onUnlocked: () -> Unit, viewModel: CompassViewModel = hiltViewModel()) {
@@ -236,180 +326,42 @@ jobs:
                   needleAnim.snapTo(-heading)
                   needleAnim.animateTo(needleAnim.value - 360f, animationSpec = tween(900, easing = LinearEasing))
                   val target = -action.targetAngle
-                  val current = needleAnim.value % 360f
-                  val diff = ((target - current + 540f) % 360f) - 180f
+                  val cur = needleAnim.value % 360f
+                  val diff = ((target - cur + 540f) % 360f) - 180f
                   needleAnim.animateTo(needleAnim.value + diff, animationSpec = spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessMedium))
                   delay(2000)
                   isAnimating = false
                   if (action.isCorrect) onUnlocked() else viewModel.resetAction()
               }
-              Box(modifier = Modifier.fillMaxSize().background(Brush.radialGradient(listOf(Color(0xFF0D1B3E), Color(0xFF060C1A)), radius = 1200f)), contentAlignment = Alignment.Center) {
-                  Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+              Box(modifier=Modifier.fillMaxSize().background(Brush.radialGradient(listOf(Color(0xFF0D1B3E),Color(0xFF060C1A)),radius=1200f)), contentAlignment=Alignment.Center) {
+                  Column(horizontalAlignment=Alignment.CenterHorizontally, verticalArrangement=Arrangement.Center) {
                       Spacer(Modifier.weight(1f))
-                      Text("COMPASS", style = MaterialTheme.typography.labelSmall, color = CompassColors.Silver400.copy(0.4f), letterSpacing = 6.sp)
+                      Text("COMPASS", style=MaterialTheme.typography.labelSmall, color=CompassColors.Silver400.copy(0.4f), letterSpacing=6.sp)
                       Spacer(Modifier.height(32.dp))
-                      Canvas(modifier = Modifier.size(280.dp)) {
-                          val c = Offset(size.width/2, size.height/2); val r = size.width/2
-                          drawCircle(Color(0xFF1E3A6E), radius=r, style=Stroke(3.dp.toPx()))
-                          drawCircle(Color(0xFF0D2047), radius=r-4.dp.toPx())
-                          drawCircle(Color(0xFF1A3060).copy(0.4f), radius=r*0.85f, style=Stroke(1.dp.toPx()))
-                          for (a in 0 until 360 step 10) {
-                              val major = a%30==0; val tl = if(major) r*0.09f else r*0.05f
-                              val rad = Math.toRadians(a.toDouble())
-                              drawLine(if(major) Color(0xFF4B82D0) else Color(0xFF2A4B7A), Offset(c.x+(r*0.88f)*sin(rad).toFloat(),c.y-(r*0.88f)*cos(rad).toFloat()), Offset(c.x+(r*0.88f-tl)*sin(rad).toFloat(),c.y-(r*0.88f-tl)*cos(rad).toFloat()), if(major) 2.dp.toPx() else 1.dp.toPx())
-                          }
-                          rotate(displayAngle, pivot=c) {
-                              drawPath(Path().apply{moveTo(c.x,c.y+7.dp.toPx());lineTo(c.x-7.dp.toPx(),c.y);lineTo(c.x,c.y-r*0.72f);lineTo(c.x+7.dp.toPx(),c.y);close()}, Color(0xFFEF4444))
-                              drawPath(Path().apply{moveTo(c.x,c.y-7.dp.toPx());lineTo(c.x-7.dp.toPx(),c.y);lineTo(c.x,c.y+r*0.55f);lineTo(c.x+7.dp.toPx(),c.y);close()}, Color(0xFFE5E7EB))
-                          }
-                          drawCircle(Color(0xFF2563C8), radius=10.dp.toPx(), center=c)
-                          drawCircle(Color(0xFF93C5FD), radius=5.dp.toPx(), center=c)
+                      Canvas(modifier=Modifier.size(280.dp)) {
+                          val c=Offset(size.width/2,size.height/2); val r=size.width/2
+                          drawCircle(Color(0xFF1E3A6E),radius=r,style=Stroke(3.dp.toPx()))
+                          drawCircle(Color(0xFF0D2047),radius=r-4.dp.toPx())
+                          drawCircle(Color(0xFF1A3060).copy(0.4f),radius=r*0.85f,style=Stroke(1.dp.toPx()))
+                          for(a in 0 until 360 step 10){val maj=a%30==0;val tl=if(maj)r*0.09f else r*0.05f;val rad=Math.toRadians(a.toDouble());drawLine(if(maj)Color(0xFF4B82D0)else Color(0xFF2A4B7A),Offset(c.x+(r*0.88f)*sin(rad).toFloat(),c.y-(r*0.88f)*cos(rad).toFloat()),Offset(c.x+(r*0.88f-tl)*sin(rad).toFloat(),c.y-(r*0.88f-tl)*cos(rad).toFloat()),if(maj)2.dp.toPx()else 1.dp.toPx())}
+                          rotate(displayAngle,pivot=c){drawPath(Path().apply{moveTo(c.x,c.y+7.dp.toPx());lineTo(c.x-7.dp.toPx(),c.y);lineTo(c.x,c.y-r*0.72f);lineTo(c.x+7.dp.toPx(),c.y);close()},Color(0xFFEF4444));drawPath(Path().apply{moveTo(c.x,c.y-7.dp.toPx());lineTo(c.x-7.dp.toPx(),c.y);lineTo(c.x,c.y+r*0.55f);lineTo(c.x+7.dp.toPx(),c.y);close()},Color(0xFFE5E7EB))}
+                          drawCircle(Color(0xFF2563C8),radius=10.dp.toPx(),center=c); drawCircle(Color(0xFF93C5FD),radius=5.dp.toPx(),center=c)
                       }
                       Spacer(Modifier.height(36.dp))
-                      Surface(onClick={if(!isAnimating) showInput=true}, color=Color(0xFF1A2E5A), shape=MaterialTheme.shapes.large, modifier=Modifier.defaultMinSize(minWidth=180.dp)) {
-                          Column(modifier=Modifier.padding(horizontal=28.dp,vertical=16.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                              Text("${heading.toInt()}°", style=MaterialTheme.typography.displaySmall, fontWeight=FontWeight.Bold, color=CompassColors.Blue300)
-                              Text(cardinal(heading), style=MaterialTheme.typography.titleMedium, color=CompassColors.Silver400)
-                          }
-                      }
+                      Surface(onClick={if(!isAnimating)showInput=true},color=Color(0xFF1A2E5A),shape=MaterialTheme.shapes.large,modifier=Modifier.defaultMinSize(minWidth=180.dp)){Column(modifier=Modifier.padding(horizontal=28.dp,vertical=16.dp),horizontalAlignment=Alignment.CenterHorizontally){Text("${heading.toInt()}°",style=MaterialTheme.typography.displaySmall,fontWeight=FontWeight.Bold,color=CompassColors.Blue300);Text(cardinal(heading),style=MaterialTheme.typography.titleMedium,color=CompassColors.Silver400)}}
                       Spacer(Modifier.height(10.dp))
-                      Text(if(isAnimating) "" else "Tap to find a direction", style=MaterialTheme.typography.labelSmall, color=CompassColors.Silver400.copy(0.45f))
+                      Text(if(isAnimating)"" else "Tap to find a direction",style=MaterialTheme.typography.labelSmall,color=CompassColors.Silver400.copy(0.45f))
                       Spacer(Modifier.weight(1f))
                   }
               }
-              if (showInput) {
-                  ModalBottomSheet(onDismissRequest={showInput=false;angleInput=""}) {
-                      Column(modifier=Modifier.fillMaxWidth().padding(horizontal=28.dp,vertical=8.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                          Text("Enter a direction", style=MaterialTheme.typography.titleLarge, fontWeight=FontWeight.Bold)
-                          Spacer(Modifier.height(6.dp))
-                          Text("Type a compass angle", style=MaterialTheme.typography.bodyMedium, color=MaterialTheme.colorScheme.onSurfaceVariant)
-                          Spacer(Modifier.height(28.dp))
-                          OutlinedTextField(value=angleInput, onValueChange={angleInput=it.filter{c->c.isDigit()}.take(3)}, label={Text("Angle")}, placeholder={Text("0 – 360")}, suffix={Text("°")}, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number), singleLine=true, modifier=Modifier.fillMaxWidth(), textStyle=MaterialTheme.typography.displaySmall.copy(fontWeight=FontWeight.Bold, color=CompassColors.Blue300))
-                          Spacer(Modifier.height(28.dp))
-                          Button(onClick={val a=angleInput.toFloatOrNull(); if(a!=null&&a in 0f..360f){showInput=false;angleInput="";viewModel.tryUnlock(a)}}, enabled=angleInput.toFloatOrNull()?.let{it in 0f..360f}==true, modifier=Modifier.fillMaxWidth().height(56.dp), colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)) { Text("Find Direction", style=MaterialTheme.typography.titleMedium) }
-                          Spacer(Modifier.height(36.dp))
-                      }
-                  }
-              }
+              if(showInput){ModalBottomSheet(onDismissRequest={showInput=false;angleInput=""}){Column(modifier=Modifier.fillMaxWidth().padding(horizontal=28.dp,vertical=8.dp),horizontalAlignment=Alignment.CenterHorizontally){Text("Enter a direction",style=MaterialTheme.typography.titleLarge,fontWeight=FontWeight.Bold);Spacer(Modifier.height(6.dp));Text("Type a compass angle",style=MaterialTheme.typography.bodyMedium,color=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.height(28.dp));OutlinedTextField(value=angleInput,onValueChange={angleInput=it.filter{c->c.isDigit()}.take(3)},label={Text("Angle")},placeholder={Text("0 – 360")},suffix={Text("°")},keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number),singleLine=true,modifier=Modifier.fillMaxWidth(),textStyle=MaterialTheme.typography.displaySmall.copy(fontWeight=FontWeight.Bold,color=CompassColors.Blue300));Spacer(Modifier.height(28.dp));Button(onClick={val a=angleInput.toFloatOrNull();if(a!=null&&a in 0f..360f){showInput=false;angleInput="";viewModel.tryUnlock(a)}},enabled=angleInput.toFloatOrNull()?.let{it in 0f..360f}==true,modifier=Modifier.fillMaxWidth().height(56.dp),colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)){Text("Find Direction",style=MaterialTheme.typography.titleMedium)};Spacer(Modifier.height(36.dp))}}}
           }
-          private fun cardinal(h: Float) = when(h) { in 337.5f..360f,in 0f..22.5f->"North"; in 22.5f..67.5f->"North-East"; in 67.5f..112.5f->"East"; in 112.5f..157.5f->"South-East"; in 157.5f..202.5f->"South"; in 202.5f..247.5f->"South-West"; in 247.5f..292.5f->"West"; else->"North-West" }
+          private fun cardinal(h:Float)=when(h){in 337.5f..360f,in 0f..22.5f->"North";in 22.5f..67.5f->"North-East";in 67.5f..112.5f->"East";in 112.5f..157.5f->"South-East";in 157.5f..202.5f->"South";in 202.5f..247.5f->"South-West";in 247.5f..292.5f->"West";else->"North-West"}
           EOF
 
-          # 10. UnlockSetupScreen with Google Drive step
-          cat > app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt << 'EOF'
-          package com.compass.diary.ui.screens.unlock
-          import androidx.compose.animation.AnimatedContent
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.shape.CircleShape
-          import androidx.compose.foundation.text.KeyboardOptions
-          import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.filled.Cloud
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.text.font.FontWeight
-          import androidx.compose.ui.text.input.KeyboardType
-          import androidx.compose.ui.text.style.TextAlign
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.unit.sp
-          import androidx.hilt.navigation.compose.hiltViewModel
-          import com.compass.diary.ui.theme.CompassColors
-          import com.compass.diary.viewmodel.SetupViewModel
-          @Composable
-          fun UnlockSetupScreen(onSetupComplete: () -> Unit, viewModel: SetupViewModel = hiltViewModel()) {
-              val step by viewModel.step.collectAsState()
-              val heading by viewModel.heading.collectAsState()
-              var angleInput by remember { mutableStateOf("") }
-              var inputError by remember { mutableStateOf(false) }
-              Box(modifier=Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF060C1A),Color(0xFF0D2047))))) {
-                  Column(modifier=Modifier.fillMaxSize().padding(24.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                      Spacer(Modifier.height(60.dp))
-                      Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                          repeat(4) { i -> Box(modifier=Modifier.size(if(i==step) 24.dp else 8.dp, 8.dp).background(if(i<=step) CompassColors.Blue400 else CompassColors.Silver700, CircleShape)) }
-                      }
-                      Spacer(Modifier.height(48.dp))
-                      AnimatedContent(targetState=step, label="s") { s ->
-                          when(s) {
-                              0 -> Column(horizontalAlignment=Alignment.CenterHorizontally) {
-                                  Text("🧭", fontSize=80.sp)
-                                  Spacer(Modifier.height(24.dp))
-                                  Text("Welcome to Compass", style=MaterialTheme.typography.headlineMedium, fontWeight=FontWeight.Bold, color=Color.White, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(12.dp))
-                                  Text("Your private diary, hidden inside a compass", style=MaterialTheme.typography.bodyLarge, color=CompassColors.Silver400, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(32.dp))
-                                  Card(colors=CardDefaults.cardColors(containerColor=Color(0xFF0D2047)), modifier=Modifier.fillMaxWidth()) {
-                                      Column(Modifier.padding(20.dp)) {
-                                          listOf("🔒  Hidden behind a real compass","✨  Unlimited daily diary pages","🤖  AI assistant for your notes","🎨  Rich text, drawings & voice").forEach {
-                                              Text(it, style=MaterialTheme.typography.bodyMedium, color=CompassColors.Silver200, modifier=Modifier.padding(vertical=5.dp))
-                                          }
-                                      }
-                                  }
-                                  Spacer(Modifier.height(40.dp))
-                                  Button(onClick={viewModel.goToStep(1)}, modifier=Modifier.fillMaxWidth().height(56.dp), colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)) { Text("Get Started", style=MaterialTheme.typography.titleMedium) }
-                              }
-                              1 -> Column(horizontalAlignment=Alignment.CenterHorizontally) {
-                                  Text("Set Your Secret Angle", style=MaterialTheme.typography.headlineMedium, fontWeight=FontWeight.Bold, color=Color.White, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(10.dp))
-                                  Text("Choose any compass angle as your secret key.\nYou'll type it each time to open your diary.", style=MaterialTheme.typography.bodyLarge, color=CompassColors.Silver400, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(32.dp))
-                                  Surface(color=Color(0xFF0D2047), shape=MaterialTheme.shapes.medium, modifier=Modifier.fillMaxWidth()) {
-                                      Column(Modifier.padding(20.dp), horizontalAlignment=Alignment.CenterHorizontally) {
-                                          Text("Current compass heading", style=MaterialTheme.typography.labelMedium, color=CompassColors.Silver400)
-                                          Spacer(Modifier.height(6.dp))
-                                          Text("${heading.toInt()}°", style=MaterialTheme.typography.displaySmall, fontWeight=FontWeight.Bold, color=CompassColors.Blue300)
-                                          Spacer(Modifier.height(10.dp))
-                                          OutlinedButton(onClick={angleInput=heading.toInt().toString()}, modifier=Modifier.fillMaxWidth()) { Text("Use this direction  (${heading.toInt()}°)") }
-                                      }
-                                  }
-                                  Spacer(Modifier.height(16.dp))
-                                  Text("— or type any angle —", style=MaterialTheme.typography.labelMedium, color=CompassColors.Silver400)
-                                  Spacer(Modifier.height(12.dp))
-                                  OutlinedTextField(value=angleInput, onValueChange={angleInput=it.filter{c->c.isDigit()}.take(3);inputError=false}, label={Text("Secret angle  (0 – 360)")}, placeholder={Text("e.g. 137")}, suffix={Text("°")}, isError=inputError, supportingText={if(inputError)Text("Enter 0 – 360")}, keyboardOptions=KeyboardOptions(keyboardType=KeyboardType.Number), singleLine=true, modifier=Modifier.fillMaxWidth(), textStyle=MaterialTheme.typography.headlineMedium.copy(fontWeight=FontWeight.Bold,color=CompassColors.Blue300))
-                                  Spacer(Modifier.height(32.dp))
-                                  Button(onClick={val a=angleInput.toFloatOrNull(); if(a!=null&&a in 0f..360f) viewModel.saveAngle1(a) else inputError=true}, enabled=angleInput.isNotBlank(), modifier=Modifier.fillMaxWidth().height(56.dp), colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)) { Text("Save as My Secret Key", style=MaterialTheme.typography.titleMedium) }
-                              }
-                              2 -> Column(horizontalAlignment=Alignment.CenterHorizontally) {
-                                  Icon(Icons.Default.Cloud, null, modifier=Modifier.size(80.dp), tint=CompassColors.Blue400)
-                                  Spacer(Modifier.height(24.dp))
-                                  Text("Connect Google Drive", style=MaterialTheme.typography.headlineMedium, fontWeight=FontWeight.Bold, color=Color.White, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(12.dp))
-                                  Text("Sync your diary to Google Drive so you can\naccess it on any phone and never lose your notes.", style=MaterialTheme.typography.bodyLarge, color=CompassColors.Silver400, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(32.dp))
-                                  Card(colors=CardDefaults.cardColors(containerColor=Color(0xFF0D2047)), modifier=Modifier.fillMaxWidth()) {
-                                      Column(Modifier.padding(20.dp)) {
-                                          listOf("☁️  Automatic cloud backup","📱  Open same diary on another phone","🔄  Real-time sync across devices","🔒  Your data stays private").forEach {
-                                              Text(it, style=MaterialTheme.typography.bodyMedium, color=CompassColors.Silver200, modifier=Modifier.padding(vertical=5.dp))
-                                          }
-                                      }
-                                  }
-                                  Spacer(Modifier.height(32.dp))
-                                  Text("Google Drive sync requires a one-time setup.\nYou can complete it now or later in Settings.", style=MaterialTheme.typography.bodySmall, color=CompassColors.Silver400, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(20.dp))
-                                  Button(onClick={viewModel.goToStep(3)}, modifier=Modifier.fillMaxWidth().height(56.dp), colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)) { Text("Set up Google Drive", style=MaterialTheme.typography.titleMedium) }
-                                  Spacer(Modifier.height(12.dp))
-                                  OutlinedButton(onClick={viewModel.goToStep(3)}, modifier=Modifier.fillMaxWidth().height(50.dp)) { Text("Skip for now") }
-                              }
-                              else -> Column(horizontalAlignment=Alignment.CenterHorizontally) {
-                                  Text("✅", fontSize=80.sp)
-                                  Spacer(Modifier.height(24.dp))
-                                  Text("All set!", style=MaterialTheme.typography.headlineMedium, fontWeight=FontWeight.Bold, color=Color.White, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(12.dp))
-                                  Text("To unlock your diary:\n1. Open Compass\n2. Tap the angle display\n3. Type your secret angle\n4. Tap Find Direction\n\nThe compass will spin and point to your angle, then open.", style=MaterialTheme.typography.bodyLarge, color=CompassColors.Silver400, textAlign=TextAlign.Center)
-                                  Spacer(Modifier.height(48.dp))
-                                  Button(onClick={viewModel.completeSetup();onSetupComplete()}, modifier=Modifier.fillMaxWidth().height(56.dp), colors=ButtonDefaults.buttonColors(containerColor=CompassColors.Blue600)) { Text("Open My Diary", style=MaterialTheme.typography.titleMedium) }
-                              }
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
-
-          # 11. DailyPageScreen - COMPLETE REWRITE with working formatting + save/lock
+          # 12. REWRITE DailyPageScreen with WORKING rich text formatting
+          #     Key fix: track spans separately, re-inject into BasicTextField each frame.
+          #     This survives keyboard onValueChange which strips AnnotatedString spans.
           cat > app/src/main/java/com/compass/diary/ui/screens/editor/DailyPageScreen.kt << 'EOF'
           package com.compass.diary.ui.screens.editor
 
@@ -438,43 +390,83 @@ jobs:
           import com.compass.diary.ui.theme.CompassColors
           import com.compass.diary.util.SaveState
           import com.compass.diary.viewmodel.DiaryViewModel
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
 
-          // Separators stored in contentJson to split locked vs draft
-          private const val SEP_LOCK  = "\u00A7L\u00A7"
-          private const val SEP_DRAFT = "\u00A7D\u00A7"
+          // ── Span tracking ──────────────────────────────────────────────
 
-          private fun pack(locked: String, draft: String) = "$SEP_LOCK$locked$SEP_DRAFT$draft"
-          private fun unpack(raw: String): Pair<String, String> {
-              if (!raw.contains(SEP_LOCK)) return "" to raw
-              val locked = raw.substringAfter(SEP_LOCK).substringBefore(SEP_DRAFT)
-              val draft  = raw.substringAfter(SEP_DRAFT, "")
-              return locked to draft
+          private enum class Fmt { BOLD, ITALIC, UNDERLINE, STRIKE }
+          private data class RSpan(val s: Int, val e: Int, val f: Fmt)
+
+          private fun Fmt.style() = when (this) {
+              Fmt.BOLD      -> SpanStyle(fontWeight = FontWeight.Bold)
+              Fmt.ITALIC    -> SpanStyle(fontStyle  = FontStyle.Italic)
+              Fmt.UNDERLINE -> SpanStyle(textDecoration = TextDecoration.Underline)
+              Fmt.STRIKE    -> SpanStyle(textDecoration = TextDecoration.LineThrough)
           }
 
-          // Apply a SpanStyle to the current text selection
-          private fun TextFieldValue.styled(style: SpanStyle): TextFieldValue {
-              val sel = selection
-              if (sel.collapsed) return this
-              val built = buildAnnotatedString {
-                  append(annotatedString.text)
-                  annotatedString.spanStyles.forEach { addStyle(it.item, it.start, it.end) }
-                  addStyle(style, sel.min, sel.max)
+          /**
+           * Adjusts span positions after text is inserted/deleted.
+           * changeAt = start of change (oldSel.min)
+           * deleteEnd = end of deleted region (oldSel.max, equals changeAt for pure insertion)
+           */
+          private fun adjust(spans: List<RSpan>, oldLen: Int, newLen: Int, changeAt: Int, deleteEnd: Int): List<RSpan> {
+              val delta = newLen - oldLen
+              if (delta == 0) return spans
+              return spans.mapNotNull { sp ->
+                  var s = when {
+                      sp.s < changeAt  -> sp.s
+                      sp.s < deleteEnd -> changeAt
+                      else             -> sp.s + delta
+                  }
+                  var e = when {
+                      sp.e <= changeAt -> sp.e
+                      sp.e <  deleteEnd -> changeAt
+                      else             -> sp.e + delta
+                  }
+                  if (s < 0) s = 0
+                  val max = newLen
+                  if (e > max) e = max
+                  if (s >= e) null else sp.copy(s = s, e = e)
               }
-              return TextFieldValue(annotatedString = built, selection = selection)
           }
 
-          private fun TextFieldValue.insert(s: String): TextFieldValue {
-              val pos = selection.end
-              val newText = text.substring(0, pos) + s + text.substring(pos)
-              return TextFieldValue(newText, TextRange(pos + s.length))
+          // ── Content serialisation (lock + draft + spans) ───────────────
+
+          private const val M_L = "\u2060\u2061"   // invisible lock marker
+          private const val M_D = "\u2061\u2062"   // invisible draft marker
+          private const val M_S = "\u2062\u2060"   // invisible spans marker
+
+          private fun serialise(locked: String, draftText: String, spans: List<RSpan>): String {
+              val sp = spans.joinToString(";") { "${it.s},${it.e},${it.f.name}" }
+              return "$M_L$locked$M_D$draftText$M_S$sp"
           }
+
+          private fun deserialise(raw: String): Triple<String, String, List<RSpan>> {
+              if (!raw.contains(M_L)) return Triple("", raw, emptyList())
+              return try {
+                  val locked = raw.substringAfter(M_L).substringBefore(M_D)
+                  val rest   = raw.substringAfter(M_D, "")
+                  val text   = rest.substringBefore(M_S)
+                  val spStr  = rest.substringAfter(M_S, "")
+                  val spans  = if (spStr.isBlank()) emptyList() else spStr.split(";").mapNotNull { p ->
+                      val t = p.split(","); if (t.size == 3) runCatching {
+                          RSpan(t[0].toInt(), t[1].toInt(), Fmt.valueOf(t[2]))
+                      }.getOrNull() else null
+                  }
+                  Triple(locked, text, spans)
+              } catch (e: Exception) {
+                  Triple("", raw, emptyList())
+              }
+          }
+
+          // ── Main screen ────────────────────────────────────────────────
 
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun DailyPageScreen(
-              dateKey: String,
-              onBack: () -> Unit,
-              onOpenAI: () -> Unit,
+              dateKey: String, onBack: () -> Unit, onOpenAI: () -> Unit,
               viewModel: DiaryViewModel = hiltViewModel()
           ) {
               val entry     by viewModel.currentEntry.collectAsState()
@@ -482,27 +474,58 @@ jobs:
 
               var lockedText  by remember { mutableStateOf("") }
               var draft       by remember { mutableStateOf(TextFieldValue()) }
+              var spans       by remember { mutableStateOf(listOf<RSpan>()) }
+              var loaded      by remember(dateKey) { mutableStateOf(false) }
               var showDrawing by remember { mutableStateOf(false) }
               var showConfirm by remember { mutableStateOf(false) }
 
-              LaunchedEffect(dateKey) { viewModel.selectEntry(dateKey) }
-
-              LaunchedEffect(entry?.contentJson) {
-                  entry?.contentJson?.let { raw ->
-                      val (locked, draftStr) = unpack(raw)
+              // Load content ONCE per dateKey (loaded flag prevents reload on every auto-save)
+              LaunchedEffect(entry) {
+                  if (!loaded && entry != null && entry!!.dateKey == dateKey) {
+                      val (locked, draftText, draftSpans) = deserialise(entry!!.contentJson)
                       lockedText = locked
-                      if (draft.text.isEmpty() && draftStr.isNotEmpty())
-                          draft = TextFieldValue(draftStr)
+                      if (draftText.isNotEmpty()) draft = TextFieldValue(draftText)
+                      spans = draftSpans
+                      loaded = true
                   }
               }
 
-              LaunchedEffect(draft.text) {
-                  viewModel.onContentChanged(dateKey, pack(lockedText, draft.text))
+              LaunchedEffect(dateKey) { viewModel.selectEntry(dateKey) }
+
+              // Debounced save
+              val scope = rememberCoroutineScope()
+              var saveJob by remember { mutableStateOf<Job?>(null) }
+              fun save() {
+                  saveJob?.cancel()
+                  saveJob = scope.launch {
+                      delay(800)
+                      viewModel.onContentChanged(dateKey, serialise(lockedText, draft.text, spans))
+                  }
+              }
+
+              // THE KEY FIX FOR FORMATTING:
+              // Build AnnotatedString from current text + spans, then pass as
+              // draft.copy(annotatedString = ...) to BasicTextField.
+              // The keyboard's onValueChange strips spans; we immediately re-inject them here.
+              val annotated = remember(draft.text, spans) {
+                  buildAnnotatedString {
+                      append(draft.text)
+                      spans.forEach { sp ->
+                          if (sp.s >= 0 && sp.e <= draft.text.length && sp.s < sp.e)
+                              addStyle(sp.f.style(), sp.s, sp.e)
+                      }
+                  }
+              }
+
+              fun applyFmt(f: Fmt) {
+                  val sel = draft.selection
+                  if (!sel.collapsed)
+                      spans = spans + RSpan(sel.min, sel.max, f)
               }
 
               if (showDrawing) {
                   DrawingCanvas(
-                      onSave  = { paths -> viewModel.saveDrawing(dateKey, paths); showDrawing = false },
+                      onSave  = { p -> viewModel.saveDrawing(dateKey, p); showDrawing = false },
                       onClose = { showDrawing = false }
                   )
                   return
@@ -513,21 +536,20 @@ jobs:
                       TopAppBar(
                           navigationIcon = {
                               IconButton(onClick = {
-                                  viewModel.forceSave(dateKey, pack(lockedText, draft.text))
+                                  saveJob?.cancel()
+                                  viewModel.onContentChanged(dateKey, serialise(lockedText, draft.text, spans))
                                   onBack()
                               }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
                           },
                           title = {
                               Column {
-                                  Text(entry?.title ?: dateKey,
-                                      style = MaterialTheme.typography.titleMedium,
-                                      fontWeight = FontWeight.SemiBold)
+                                  Text(entry?.title ?: dateKey, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                                   Text(
                                       when (saveState) {
                                           SaveState.SAVING -> "Saving…"
                                           SaveState.SAVED  -> "Saved ✓"
-                                          SaveState.ERROR  -> "Error"
-                                          else             -> "${entry?.wordCount ?: 0} words"
+                                          SaveState.ERROR  -> "Save error"
+                                          else -> "${entry?.wordCount ?: 0} words"
                                       },
                                       style = MaterialTheme.typography.labelSmall,
                                       color = when (saveState) {
@@ -544,16 +566,14 @@ jobs:
                                       Icon(Icons.Default.Save, "Save & Lock", tint = CompassColors.Gold400)
                                   }
                               }
-                              IconButton(onClick = onOpenAI) {
-                                  Icon(Icons.Default.AutoAwesome, "AI")
-                              }
+                              IconButton(onClick = onOpenAI) { Icon(Icons.Default.AutoAwesome, "AI") }
                           }
                       )
                   }
               ) { padding ->
                   Column(modifier = Modifier.fillMaxSize().padding(padding)) {
 
-                      // ── FORMAT TOOLBAR ────────────────────────────────
+                      // ── FORMAT TOOLBAR ─────────────────────────────
                       Row(
                           modifier = Modifier
                               .fillMaxWidth()
@@ -563,29 +583,24 @@ jobs:
                           horizontalArrangement = Arrangement.spacedBy(2.dp),
                           verticalAlignment = Alignment.CenterVertically
                       ) {
-                          FmtBtn("B", weight = FontWeight.Bold)   { draft = draft.styled(SpanStyle(fontWeight = FontWeight.Bold)) }
-                          FmtBtn("I", style = FontStyle.Italic)   { draft = draft.styled(SpanStyle(fontStyle = FontStyle.Italic)) }
-                          FmtBtn("U", deco = TextDecoration.Underline) { draft = draft.styled(SpanStyle(textDecoration = TextDecoration.Underline)) }
-                          FmtBtn("S̶", deco = TextDecoration.LineThrough) { draft = draft.styled(SpanStyle(textDecoration = TextDecoration.LineThrough)) }
-                          VerticalDivider(modifier = Modifier.height(28.dp).padding(horizontal = 4.dp))
-                          SmallIconBtn(Icons.Default.List, "Bullet")     { draft = draft.insert("\n• ") }
-                          SmallIconBtn(Icons.Default.FormatListNumbered, "Numbered") {
-                              draft = draft.insert("\n${draft.text.count { it == '\n' } + 1}. ")
-                          }
-                          SmallIconBtn(Icons.Default.CheckBox, "Checklist") { draft = draft.insert("\n☐ ") }
-                          VerticalDivider(modifier = Modifier.height(28.dp).padding(horizontal = 4.dp))
-                          SmallIconBtn(Icons.Default.Draw, "Draw") { showDrawing = true }
-                          SmallIconBtn(Icons.Default.Star, "Star") {
+                          FBtn("B", FontWeight.Bold)   { applyFmt(Fmt.BOLD) }
+                          FBtn("I", style = FontStyle.Italic) { applyFmt(Fmt.ITALIC) }
+                          FBtn("U", deco = TextDecoration.Underline) { applyFmt(Fmt.UNDERLINE) }
+                          FBtn("S̶", deco = TextDecoration.LineThrough) { applyFmt(Fmt.STRIKE) }
+                          VerticalDivider(Modifier.height(28.dp).padding(horizontal = 4.dp))
+                          FIcon(Icons.Default.List)                 { draft = draft.ins("\n• ");      save() }
+                          FIcon(Icons.Default.FormatListNumbered)   { draft = draft.ins("\n${draft.text.count{it=='\n'}+1}. "); save() }
+                          FIcon(Icons.Default.CheckBox)             { draft = draft.ins("\n☐ ");      save() }
+                          VerticalDivider(Modifier.height(28.dp).padding(horizontal = 4.dp))
+                          FIcon(Icons.Default.Draw)  { showDrawing = true }
+                          FIcon(Icons.Default.Star)  {
                               val sel = draft.selection
-                              if (!sel.collapsed) {
-                                  val selected = draft.text.substring(sel.start, sel.end)
-                                  viewModel.starContent(dateKey, selected)
-                              }
+                              if (!sel.collapsed) viewModel.starContent(dateKey, draft.text.substring(sel.min, sel.max))
                           }
                       }
                       HorizontalDivider()
 
-                      // ── EDITOR AREA ───────────────────────────────────
+                      // ── EDITOR ─────────────────────────────────────
                       Column(
                           modifier = Modifier
                               .fillMaxSize()
@@ -593,56 +608,49 @@ jobs:
                               .padding(horizontal = 20.dp, vertical = 16.dp)
                               .imePadding()
                       ) {
-                          // Locked content (read-only)
+                          // Locked section (read-only)
                           if (lockedText.isNotBlank()) {
                               Surface(
                                   color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                                   shape = RoundedCornerShape(8.dp),
                                   modifier = Modifier.fillMaxWidth()
                               ) {
-                                  Column(modifier = Modifier.padding(14.dp)) {
+                                  Column(Modifier.padding(14.dp)) {
                                       Row(verticalAlignment = Alignment.CenterVertically) {
-                                          Icon(Icons.Default.Lock, null, modifier = Modifier.size(13.dp), tint = CompassColors.Success)
+                                          Icon(Icons.Default.Lock, null, Modifier.size(13.dp), tint = CompassColors.Success)
                                           Spacer(Modifier.width(4.dp))
-                                          Text("Saved — read only",
-                                              style = MaterialTheme.typography.labelSmall,
-                                              color = CompassColors.Success)
+                                          Text("Saved — read only", style = MaterialTheme.typography.labelSmall, color = CompassColors.Success)
                                       }
                                       Spacer(Modifier.height(8.dp))
-                                      Text(lockedText,
-                                          style = MaterialTheme.typography.bodyLarge,
-                                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f))
+                                      Text(lockedText, style = MaterialTheme.typography.bodyLarge,
+                                          color = MaterialTheme.colorScheme.onSurface.copy(0.75f))
                                   }
                               }
-                              HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-                              Text("Add more below ↓",
-                                  style = MaterialTheme.typography.labelSmall,
+                              HorizontalDivider(Modifier.padding(vertical = 16.dp))
+                              Text("Continue below ↓", style = MaterialTheme.typography.labelSmall,
                                   color = MaterialTheme.colorScheme.onSurfaceVariant,
                                   modifier = Modifier.align(Alignment.CenterHorizontally))
                               Spacer(Modifier.height(12.dp))
                           }
 
-                          // Editable draft area
+                          // Editable area — passes annotated string with our spans re-injected
                           BasicTextField(
-                              value = draft,
-                              onValueChange = { draft = it },
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .defaultMinSize(minHeight = 220.dp),
+                              value = draft.copy(annotatedString = annotated),
+                              onValueChange = { nv ->
+                                  // Adjust span positions for the text change, then store plain text
+                                  spans = adjust(spans, draft.text.length, nv.text.length, draft.selection.min, draft.selection.max)
+                                  draft = nv
+                                  save()
+                              },
+                              modifier = Modifier.fillMaxWidth().defaultMinSize(minHeight = 240.dp),
                               textStyle = MaterialTheme.typography.bodyLarge.copy(
-                                  color     = MaterialTheme.colorScheme.onBackground,
-                                  lineHeight = 26.sp
-                              ),
+                                  color = MaterialTheme.colorScheme.onBackground, lineHeight = 26.sp),
                               cursorBrush = SolidColor(CompassColors.Blue400),
                               decorationBox = { inner ->
-                                  if (draft.text.isEmpty()) {
-                                      Text(
-                                          if (lockedText.isBlank()) "Write anything…"
-                                          else "Continue your entry…",
+                                  if (draft.text.isEmpty())
+                                      Text(if (lockedText.isBlank()) "Write anything…" else "Continue your entry…",
                                           style = MaterialTheme.typography.bodyLarge.copy(
-                                              color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
-                                      )
-                                  }
+                                              color = MaterialTheme.colorScheme.onSurfaceVariant.copy(0.4f)))
                                   inner()
                               }
                           )
@@ -650,68 +658,207 @@ jobs:
                   }
               }
 
-              // Save & Lock confirmation
+              // Save & Lock dialog
               if (showConfirm) {
                   AlertDialog(
                       onDismissRequest = { showConfirm = false },
-                      icon  = { Icon(Icons.Default.Lock, null, tint = CompassColors.Gold400) },
+                      icon = { Icon(Icons.Default.Lock, null, tint = CompassColors.Gold400) },
                       title = { Text("Save and lock?") },
-                      text  = {
-                          Text("Your current writing will be permanently saved. " +
-                               "You can still add more below it, but saved content cannot be edited or deleted.")
-                      },
+                      text  = { Text("The current text will be permanently saved and locked. You can add more below it but cannot edit or delete it.") },
                       confirmButton = {
-                          Button(
-                              onClick = {
-                                  val combined = if (lockedText.isBlank()) draft.text
-                                                 else "$lockedText\n\n${draft.text}"
-                                  lockedText  = combined
-                                  draft       = TextFieldValue()
-                                  viewModel.onContentChanged(dateKey, pack(combined, ""))
-                                  showConfirm = false
-                              },
-                              colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Gold400)
-                          ) { Text("Save & Lock") }
+                          Button(onClick = {
+                              val combined = if (lockedText.isBlank()) draft.text else "$lockedText\n\n${draft.text}"
+                              lockedText = combined
+                              draft = TextFieldValue()
+                              spans = emptyList()
+                              viewModel.onContentChanged(dateKey, serialise(combined, "", emptyList()))
+                              showConfirm = false
+                          }, colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Gold400)) { Text("Save & Lock") }
                       },
-                      dismissButton = {
-                          TextButton(onClick = { showConfirm = false }) { Text("Not yet") }
-                      }
+                      dismissButton = { TextButton(onClick = { showConfirm = false }) { Text("Not yet") } }
                   )
               }
           }
 
-          @Composable
-          private fun FmtBtn(
-              label: String,
-              weight: FontWeight    = FontWeight.Normal,
-              style: FontStyle      = FontStyle.Normal,
-              deco: TextDecoration? = null,
-              onClick: () -> Unit
-          ) {
-              Surface(
-                  onClick = onClick,
-                  shape   = RoundedCornerShape(6.dp),
-                  color   = Color.Transparent,
-                  modifier = Modifier.size(36.dp)
-              ) {
-                  Box(contentAlignment = Alignment.Center) {
-                      Text(label,
-                          fontWeight = weight,
-                          fontStyle  = style,
-                          style      = MaterialTheme.typography.labelLarge.copy(textDecoration = deco),
-                          color      = MaterialTheme.colorScheme.onSurface)
-                  }
+          @Composable private fun FBtn(label: String, weight: FontWeight = FontWeight.Normal, style: FontStyle = FontStyle.Normal, deco: TextDecoration? = null, onClick: () -> Unit) {
+              Surface(onClick=onClick, shape=RoundedCornerShape(6.dp), color=Color.Transparent, modifier=Modifier.size(36.dp)) {
+                  Box(contentAlignment=Alignment.Center) { Text(label, fontWeight=weight, fontStyle=style, style=MaterialTheme.typography.labelLarge.copy(textDecoration=deco), color=MaterialTheme.colorScheme.onSurface) }
               }
           }
+          @Composable private fun FIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+              IconButton(onClick=onClick, modifier=Modifier.size(36.dp)) { Icon(icon, null, modifier=Modifier.size(18.dp)) }
+          }
+          private fun TextFieldValue.ins(text: String): TextFieldValue {
+              val p = selection.end
+              return TextFieldValue(this.text.substring(0,p)+text+this.text.substring(p), TextRange(p+text.length))
+          }
+          EOF
+
+          # 13. UnlockSetupScreen with real Google Sign-In
+          cat > app/src/main/java/com/compass/diary/ui/screens/unlock/UnlockSetupScreen.kt << 'EOF'
+          package com.compass.diary.ui.screens.unlock
+
+          import android.app.Activity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.animation.AnimatedContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Cloud
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.hilt.navigation.compose.hiltViewModel
+          import com.compass.diary.ui.theme.CompassColors
+          import com.compass.diary.viewmodel.SetupViewModel
 
           @Composable
-          private fun SmallIconBtn(
-              icon: androidx.compose.ui.graphics.vector.ImageVector,
-              desc: String,
-              onClick: () -> Unit
-          ) {
-              IconButton(onClick = onClick, modifier = Modifier.size(36.dp)) {
-                  Icon(icon, desc, modifier = Modifier.size(18.dp))
+          fun UnlockSetupScreen(onSetupComplete: () -> Unit, viewModel: SetupViewModel = hiltViewModel()) {
+              val step    by viewModel.step.collectAsState()
+              val heading by viewModel.heading.collectAsState()
+              var angleInput by remember { mutableStateOf("") }
+              var inputError by remember { mutableStateOf(false) }
+              var driveStatus by remember { mutableStateOf("") }
+              val context = LocalContext.current
+
+              // Google Sign-In launcher — must be at composable root level
+              val signInLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == Activity.RESULT_OK) {
+                      try {
+                          val task = com.google.android.gms.auth.api.signin.GoogleSignIn
+                              .getSignedInAccountFromIntent(result.data)
+                          val account = task.getResult(com.google.android.gms.common.api.ApiException::class.java)
+                          val email = account?.email ?: ""
+                          if (email.isNotBlank()) {
+                              viewModel.saveGoogleAccount(email)
+                              driveStatus = "Connected as $email"
+                          }
+                      } catch (e: Exception) {
+                          driveStatus = "Sign-in failed — you can connect later in Settings"
+                      }
+                  }
+                  viewModel.goToStep(3)
+              }
+
+              fun launchGoogleSignIn() {
+                  val gso = com.google.android.gms.auth.api.signin.GoogleSignInOptions
+                      .Builder(com.google.android.gms.auth.api.signin.GoogleSignInOptions.DEFAULT_SIGN_IN)
+                      .requestEmail().build()
+                  val client = com.google.android.gms.auth.api.signin.GoogleSignIn.getClient(context, gso)
+                  signInLauncher.launch(client.signInIntent)
+              }
+
+              Box(modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF060C1A), Color(0xFF0D2047))))) {
+                  Column(modifier = Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                      Spacer(Modifier.height(60.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          repeat(4) { i -> Box(modifier = Modifier.size(if(i==step) 24.dp else 8.dp, 8.dp).background(if(i<=step) CompassColors.Blue400 else CompassColors.Silver700, CircleShape)) }
+                      }
+                      Spacer(Modifier.height(48.dp))
+
+                      AnimatedContent(targetState = step, label = "s") { s ->
+                          when (s) {
+                              // ── Step 0: Welcome ──────────────────────
+                              0 -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Text("🧭", fontSize = 80.sp)
+                                  Spacer(Modifier.height(24.dp))
+                                  Text("Welcome to Compass", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(12.dp))
+                                  Text("Your private diary, hidden inside a compass", style = MaterialTheme.typography.bodyLarge, color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(32.dp))
+                                  Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0D2047)), modifier = Modifier.fillMaxWidth()) {
+                                      Column(Modifier.padding(20.dp)) {
+                                          listOf("🔒  Hidden behind a real compass","✨  Unlimited daily diary pages","🤖  AI assistant for your notes","🎨  Rich text, drawings & voice").forEach {
+                                              Text(it, style = MaterialTheme.typography.bodyMedium, color = CompassColors.Silver200, modifier = Modifier.padding(vertical = 5.dp))
+                                          }
+                                      }
+                                  }
+                                  Spacer(Modifier.height(40.dp))
+                                  Button(onClick = { viewModel.goToStep(1) }, modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) { Text("Get Started", style = MaterialTheme.typography.titleMedium) }
+                              }
+
+                              // ── Step 1: Set secret angle ──────────────
+                              1 -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Text("Set Your Secret Angle", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(10.dp))
+                                  Text("Choose any compass angle as your secret key.\nYou'll type it each time to unlock your diary.", style = MaterialTheme.typography.bodyLarge, color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(32.dp))
+                                  Surface(color = Color(0xFF0D2047), shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth()) {
+                                      Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text("Current compass heading", style = MaterialTheme.typography.labelMedium, color = CompassColors.Silver400)
+                                          Spacer(Modifier.height(6.dp))
+                                          Text("${heading.toInt()}°", style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold, color = CompassColors.Blue300)
+                                          Spacer(Modifier.height(10.dp))
+                                          OutlinedButton(onClick = { angleInput = heading.toInt().toString() }, modifier = Modifier.fillMaxWidth()) { Text("Use this direction (${heading.toInt()}°)") }
+                                      }
+                                  }
+                                  Spacer(Modifier.height(16.dp))
+                                  Text("— or type any angle —", style = MaterialTheme.typography.labelMedium, color = CompassColors.Silver400)
+                                  Spacer(Modifier.height(12.dp))
+                                  OutlinedTextField(value = angleInput, onValueChange = { angleInput = it.filter{c->c.isDigit()}.take(3); inputError = false }, label = { Text("Secret angle (0 – 360)") }, placeholder = { Text("e.g. 137") }, suffix = { Text("°") }, isError = inputError, supportingText = { if(inputError) Text("Enter 0 – 360") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true, modifier = Modifier.fillMaxWidth(), textStyle = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Bold, color = CompassColors.Blue300))
+                                  Spacer(Modifier.height(32.dp))
+                                  Button(onClick = { val a = angleInput.toFloatOrNull(); if(a!=null&&a in 0f..360f) viewModel.saveAngle1(a) else inputError=true }, enabled = angleInput.isNotBlank(), modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) { Text("Save as My Secret Key", style = MaterialTheme.typography.titleMedium) }
+                              }
+
+                              // ── Step 2: Google Drive ──────────────────
+                              2 -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Icon(Icons.Default.Cloud, null, modifier = Modifier.size(80.dp), tint = CompassColors.Blue400)
+                                  Spacer(Modifier.height(24.dp))
+                                  Text("Connect Google Drive", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(12.dp))
+                                  Text("Sign in with Google to sync your diary to Drive.\nAccess the same diary from any phone.", style = MaterialTheme.typography.bodyLarge, color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(32.dp))
+                                  Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF0D2047)), modifier = Modifier.fillMaxWidth()) {
+                                      Column(Modifier.padding(20.dp)) {
+                                          listOf("☁️  Automatic cloud backup","📱  Same diary on any phone","🔄  Changes sync automatically","🔒  Private — only your account").forEach {
+                                              Text(it, style = MaterialTheme.typography.bodyMedium, color = CompassColors.Silver200, modifier = Modifier.padding(vertical = 5.dp))
+                                          }
+                                      }
+                                  }
+                                  Spacer(Modifier.height(32.dp))
+                                  // Real Google Sign-In button
+                                  Button(
+                                      onClick = { launchGoogleSignIn() },
+                                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4285F4))
+                                  ) {
+                                      Text("Sign in with Google", style = MaterialTheme.typography.titleMedium)
+                                  }
+                                  Spacer(Modifier.height(12.dp))
+                                  OutlinedButton(onClick = { viewModel.goToStep(3) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                                      Text("Skip for now — connect later in Settings")
+                                  }
+                              }
+
+                              // ── Step 3: Done ──────────────────────────
+                              else -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Text("✅", fontSize = 80.sp)
+                                  Spacer(Modifier.height(24.dp))
+                                  Text("All set!", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(12.dp))
+                                  Text("To unlock your diary:\n1. Open the app\n2. Tap the angle display\n3. Type your secret angle\n4. Tap Find Direction\n\nThe compass will spin and point to your angle.", style = MaterialTheme.typography.bodyLarge, color = CompassColors.Silver400, textAlign = TextAlign.Center)
+                                  Spacer(Modifier.height(48.dp))
+                                  Button(onClick = { viewModel.completeSetup(); onSetupComplete() }, modifier = Modifier.fillMaxWidth().height(56.dp), colors = ButtonDefaults.buttonColors(containerColor = CompassColors.Blue600)) {
+                                      Text("Open My Diary", style = MaterialTheme.typography.titleMedium)
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
           }
           EOF
