@@ -1,48 +1,30 @@
 package com.compass.diary.util
 
 import android.content.Context
-import androidx.work.*
-import com.compass.diary.data.repository.DiaryRepository
+import androidx.hilt.work.HiltWorker
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.compass.diary.data.repository.DriveSync
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
 import kotlinx.coroutines.flow.first
-import java.util.concurrent.TimeUnit
 
-/**
- * Background worker that syncs unsynced diary entries to Google Drive.
- * Uses WorkManager for battery-efficient background execution.
- * 
- * NOTE: To enable Drive sync, wire up the uploadToGoogleDrive() stub
- * with your OAuth token from Google Sign-In.
- */
-class SyncWorker(
-    context: Context,
-    params: WorkerParameters
+@HiltWorker
+class SyncWorker @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters,
+    private val driveSync: DriveSync,
+    private val prefs: PreferencesManager
 ) : CoroutineWorker(context, params) {
 
-    companion object {
-        const val WORK_NAME = "compass_sync"
-
-        fun schedule(context: Context) {
-            val request = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                        .build()
-                )
-                .build()
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
-                WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, request
-            )
-        }
-
-        fun syncNow(context: Context) {
-            WorkManager.getInstance(context)
-                .enqueue(OneTimeWorkRequestBuilder<SyncWorker>().build())
-        }
-    }
-
     override suspend fun doWork(): Result {
-        // TODO: Inject DiaryRepository and GoogleDriveRepository here
-        // For now this is a no-op stub
-        return Result.success()
+        val account = prefs.googleAccount.first()
+        val enabled = prefs.isAutoSyncEnabled.first()
+        if (account.isNullOrBlank() || !enabled) return Result.success()
+
+        val uploadOk = driveSync.uploadAll().isSuccess
+        val downloadOk = driveSync.downloadAndRestore().isSuccess
+
+        return if (uploadOk || downloadOk) Result.success() else Result.retry()
     }
 }

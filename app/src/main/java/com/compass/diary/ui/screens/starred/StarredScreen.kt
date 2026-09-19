@@ -5,8 +5,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -14,7 +13,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.compass.diary.data.local.entity.StarredItemEntity
 import com.compass.diary.ui.theme.CompassColors
 import com.compass.diary.viewmodel.DiaryViewModel
 import java.text.SimpleDateFormat
@@ -22,13 +20,9 @@ import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun StarredScreen(
-    onOpenPage: (String) -> Unit,
-    onBack: () -> Unit,
-    viewModel: DiaryViewModel = hiltViewModel()
-) {
+fun StarredScreen(onPage: (String) -> Unit, onBack: () -> Unit, viewModel: DiaryViewModel = hiltViewModel()) {
     val starred by viewModel.allStarred.collectAsState()
-    val df = remember { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()) }
+    val df = remember { SimpleDateFormat("dd MMM yyyy, h:mm a", Locale.getDefault()) }
 
     Scaffold(
         topBar = {
@@ -45,78 +39,53 @@ fun StarredScreen(
         }
     ) { padding ->
         if (starred.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentAlignment = Alignment.Center
-            ) {
+            Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("⭐", style = MaterialTheme.typography.displaySmall)
                     Spacer(Modifier.height(12.dp))
                     Text("No starred items yet", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Select text in a diary page and tap ★ to star it",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Text("Select text in a diary page and tap ★", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                item {
-                    Text(
-                        "${starred.size} starred item${if (starred.size != 1) "s" else ""}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+            LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                item { Text("${starred.size} starred item${if (starred.size != 1) "s" else ""}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                
+                
                 items(starred, key = { it.id }) { item ->
-                    StarredItemCard(
-                        item = item,
-                        dateLabel = df.format(Date(item.starredAt)),
-                        onOpen = { onOpenPage(item.diaryDateKey) },
-                        onDelete = { viewModel.removeStarred(item.id) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun StarredItemCard(
-    item: StarredItemEntity,
-    dateLabel: String,
-    onOpen: () -> Unit,
-    onDelete: () -> Unit
-) {
-    Card(
-        onClick = onOpen,
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
-            Icon(Icons.Default.Star, null, tint = CompassColors.Star, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    item.preview.ifBlank { item.contentJson.take(80) },
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "From page: ${item.diaryDateKey}  •  $dateLabel",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Delete, "Remove star", modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    var showConfirm by remember { mutableStateOf(false) }
+                    Card(onClick = { onPage(item.diaryDateKey) }, Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
+                            Icon(Icons.Default.Star, null, tint = CompassColors.Star, modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(item.preview.ifBlank { item.contentJson.take(80) }, style = MaterialTheme.typography.bodyMedium)
+                                Spacer(Modifier.height(4.dp))
+                                Text("${item.diaryDateKey}  •  ${df.format(Date(item.starredAt))}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            IconButton(onClick = { showConfirm = true }, Modifier.size(32.dp)) {
+                                Icon(Icons.Default.Delete, "Remove", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                    if (showConfirm) {
+                        AlertDialog(
+                            onDismissRequest = { showConfirm = false },
+                            icon  = { Icon(Icons.Default.Delete, null) },
+                            title = { Text("Remove starred item?") },
+                            text  = { Text("This only removes it from your Starred collection — the diary page itself is untouched.") },
+                            confirmButton = {
+                                TextButton(onClick = { viewModel.removeStarred(item.id); showConfirm = false }) {
+                                    Text("Remove", color = CompassColors.Error)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showConfirm = false }) { Text("Cancel") }
+                            }
+                        )
+                    }
+                }               
             }
         }
     }

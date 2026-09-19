@@ -1,7 +1,8 @@
 package com.compass.diary.ui.screens.settings
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.*
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -12,30 +13,61 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.compass.diary.BuildConfig
 import com.compass.diary.ui.theme.CompassColors
 import com.compass.diary.viewmodel.SettingsViewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
+    onAI: () -> Unit,
+    onReminders: () -> Unit,
+    onExport: () -> Unit,
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
-    val darkMode            by viewModel.darkMode.collectAsState()
-    val notificationsOn     by viewModel.notificationsEnabled.collectAsState()
-    val autoSync            by viewModel.autoSync.collectAsState()
-    val googleAccount       by viewModel.googleAccount.collectAsState()
-    val lastSync            by viewModel.lastSyncLabel.collectAsState()
-    val apiKey              by viewModel.anthropicApiKey.collectAsState()
-    var showApiKeyDialog    by remember { mutableStateOf(false) }
-    var showChangePasscode  by remember { mutableStateOf(false) }
-    var showAbout           by remember { mutableStateOf(false) }
+    val darkMode    by viewModel.darkMode.collectAsState()
+    val notifOn     by viewModel.notificationsEnabled.collectAsState()
+    val autoSync    by viewModel.autoSync.collectAsState()
+    val account     by viewModel.googleAccount.collectAsState()
+    val syncStatus  by viewModel.syncStatus.collectAsState()
+    val lastSync    by viewModel.lastSyncLabel.collectAsState()
+    val apiKey      by viewModel.anthropicApiKey.collectAsState()
+    var showApiDlg  by remember { mutableStateOf(false) }
+    val updateInfo  by viewModel.updateInfo.collectAsState()
+    val checkingUpd by viewModel.checkingUpdate.collectAsState()
+    val updateMsg   by viewModel.updateCheckMessage.collectAsState()
+    val masterOn    by viewModel.masterControlEnabled.collectAsState()
+    val context     = LocalContext.current
+    val scope       = rememberCoroutineScope()
+
+    var tapCount by remember { mutableStateOf(0) }
+    var showPasswordDlg by remember { mutableStateOf(false) }
+    var showMasterDlg by remember { mutableStateOf(false) }
+    var passwordError by remember { mutableStateOf(false) }
+
+    fun onCompassTapped() {
+        tapCount++
+        if (tapCount == 1) {
+            scope.launch {
+                delay(3000)
+                tapCount = 0
+            }
+        }
+        if (tapCount >= 10) {
+            tapCount = 0
+            showPasswordDlg = true
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -45,142 +77,169 @@ fun SettingsScreen(
             )
         }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(padding)
-        ) {
-            // ── ACCOUNT ─────────────────────────────────────────────
-            SettingsSection("Account") {
-                AccountRow(email = googleAccount ?: "Not signed in")
-                SettingsDivider()
-                SettingsRow(
-                    icon  = Icons.Default.Sync,
-                    title = "Auto-sync to Google Drive",
-                    subtitle = "Last sync: $lastSync",
-                    trailing = {
-                        Switch(checked = autoSync, onCheckedChange = viewModel::setAutoSync)
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(padding)) {
+
+            Section("Google Drive") {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AccountCircle, null, Modifier.size(40.dp), tint = CompassColors.Blue400)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(if (account != null) "Connected" else "Not connected",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (account != null) CompassColors.Success else MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(account ?: "Sign in to enable cloud sync",
+                            style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                     }
-                )
-                SettingsDivider()
-                SettingsRow(
-                    icon  = Icons.Default.CloudUpload,
-                    title = "Sync now",
-                    onClick = { viewModel.syncNow() }
-                )
+                }
+                Div()
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Sync, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Auto-sync", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                        Text("Last: $lastSync", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(autoSync, viewModel::setAutoSync)
+                }
+                Div()
+                SRow(Icons.Default.CloudUpload, "Sync now",
+                    subtitle = syncStatus.ifBlank { "Upload all entries to Drive" },
+                    onClick = viewModel::syncNow)
             }
 
-            // ── SECURITY ─────────────────────────────────────────────
-            SettingsSection("Security") {
-                SettingsRow(
-                    icon  = Icons.Default.Explore,
-                    title = "Change compass lock",
-                    subtitle = "Update your secret directions",
-                    onClick = { showChangePasscode = true }
-                )
-                SettingsDivider()
-                SettingsRow(
-                    icon  = Icons.Default.Fingerprint,
-                    title = "Biometric unlock",
-                    trailing = {
-                        val biometric by viewModel.biometricEnabled.collectAsState()
-                        Switch(checked = biometric, onCheckedChange = viewModel::setBiometric)
-                    }
-                )
+            Section("Tools") {
+                SRow(Icons.Default.AutoAwesome, "AI Assistant",
+                    subtitle = "Ask questions about your diary",
+                    onClick = onAI)
+                Div()
+                SRow(Icons.Default.Notifications, "Reminders",
+                    subtitle = "Manage your reminders",
+                    onClick = onReminders)
+                Div()
+                SRow(Icons.Default.FileDownload, "Export Data",
+                    subtitle = "Save a password-protected backup to your phone",
+                    onClick = onExport)
             }
 
-            // ── AI ASSISTANT ──────────────────────────────────────────
-            SettingsSection("AI Assistant") {
-                SettingsRow(
-                    icon  = Icons.Default.Key,
-                    title = "Anthropic API Key",
+            Section("Security") {
+                SRow(Icons.Default.Explore, "Compass lock",
+                    subtitle = "Type your secret angle to unlock",
+                    onClick = {})
+                Div()
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Fingerprint, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Biometric unlock", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    }
+                    val bio by viewModel.biometricEnabled.collectAsState()
+                    Switch(bio, viewModel::setBiometric)
+                }
+            }
+
+            Section("AI Assistant") {
+                SRow(Icons.Default.Key, "Gemini API Key",
                     subtitle = if (apiKey.isNullOrBlank()) "Not configured" else "••••••••${apiKey?.takeLast(4)}",
-                    onClick = { showApiKeyDialog = true }
-                )
-                SettingsDivider()
-                SettingsRow(
-                    icon = Icons.Default.Info,
-                    title = "About AI features",
-                    subtitle = "Uses Claude Sonnet to search and summarise your diary",
-                    onClick = {}
-                )
+                    onClick = { showApiDlg = true })
+                Div()
+                SRow(Icons.Default.Info, "About AI",
+                    subtitle = "Uses Gemini to search your notes, songs, voice notes, and recent photos",
+                    onClick = {})
             }
 
-            // ── APPEARANCE ────────────────────────────────────────────
-            SettingsSection("Appearance") {
-                SettingsRow(
-                    icon  = Icons.Default.DarkMode,
-                    title = "Theme",
-                    subtitle = darkMode,
-                    trailing = {
-                        var expanded by remember { mutableStateOf(false) }
-                        Box {
-                            TextButton(onClick = { expanded = true }) { Text(darkMode) }
-                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                                listOf("SYSTEM", "DARK", "LIGHT").forEach { mode ->
-                                    DropdownMenuItem(
-                                        text = { Text(mode.lowercase().replaceFirstChar { it.uppercase() }) },
-                                        onClick = { viewModel.setDarkMode(mode); expanded = false }
-                                    )
-                                }
+            Section("Appearance") {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.DarkMode, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(16.dp))
+                    Text("Theme", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                    var exp by remember { mutableStateOf(false) }
+                    Box {
+                        TextButton(onClick = { exp = true }) { Text(darkMode) }
+                        DropdownMenu(exp, { exp = false }) {
+                            listOf("SYSTEM","DARK","LIGHT").forEach { m ->
+                                DropdownMenuItem({ Text(m.lowercase().replaceFirstChar { it.uppercase() }) },
+                                    onClick = { viewModel.setDarkMode(m); exp = false })
                             }
                         }
                     }
-                )
+                }
             }
 
-            // ── NOTIFICATIONS ─────────────────────────────────────────
-            SettingsSection("Notifications") {
-                SettingsRow(
-                    icon  = Icons.Default.Notifications,
-                    title = "Android notifications",
-                    subtitle = "Show diary reminders in notification bar",
-                    trailing = {
-                        Switch(checked = notificationsOn, onCheckedChange = viewModel::setNotifications)
+            Section("Notifications") {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Notifications, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Android notifications", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                        Text("Show reminder notifications", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                )
+                    Switch(notifOn, viewModel::setNotifications)
+                }
             }
 
-            // ── DATA ──────────────────────────────────────────────────
-            SettingsSection("Data & Privacy") {
-                SettingsRow(
-                    icon  = Icons.Default.DeleteSweep,
-                    title = "Export diary",
-                    subtitle = "Export all pages as text files",
-                    onClick = { viewModel.exportDiary() }
+            Section("About") {
+                SRow(Icons.Default.Info, "Compass",
+                    subtitle = "Version ${BuildConfig.VERSION_NAME}  •  No ads  •  No tracking",
+                    onClick = { onCompassTapped() })
+                Div()
+                SRow(
+                    Icons.Default.SystemUpdate,
+                    "Check for updates",
+                    subtitle = when {
+                        checkingUpd -> "Checking…"
+                        updateMsg != null -> updateMsg!!
+                        else -> "Tap to check GitHub for a newer version"
+                    },
+                    onClick = { viewModel.checkForUpdate() }
                 )
-                SettingsDivider()
-                SettingsRow(
-                    icon  = Icons.Default.Lock,
-                    title = "Encryption",
-                    subtitle = "All data is encrypted with SQLCipher AES-256",
-                    onClick = {}
-                )
-                SettingsDivider()
-                SettingsRow(
-                    icon  = Icons.Default.PrivacyTip,
-                    title = "Privacy",
-                    subtitle = "No ads, no analytics, no tracking",
-                    onClick = {}
-                )
+                if (updateInfo != null) {
+                    Div()
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable {
+                                val url = updateInfo!!.downloadUrl.ifBlank { updateInfo!!.releaseUrl }
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                            }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.CloudDownload, null, Modifier.size(22.dp), tint = CompassColors.Gold400)
+                        Spacer(Modifier.width(16.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Update available: ${updateInfo!!.versionName}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium, color = CompassColors.Gold400)
+                            Text("Tap to download", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+                Div()
+                SRow(Icons.Default.Lock, "Privacy", subtitle = "All data stored locally and on your own Google Drive", onClick = {})
             }
 
-            // ── ABOUT ─────────────────────────────────────────────────
-            SettingsSection("About") {
-                SettingsRow(
-                    icon  = Icons.Default.Info,
-                    title = "Compass",
-                    subtitle = "Version 1.0.0",
-                    onClick = { showAbout = true }
-                )
+            if (masterOn) {
+                Spacer(Modifier.height(4.dp))
+                Surface(color = CompassColors.Error.copy(alpha = 0.15f), shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, null, tint = CompassColors.Error)
+                        Spacer(Modifier.width(10.dp))
+                        Text("Master Control is ON — edit/delete unlocked everywhere",
+                            style = MaterialTheme.typography.bodySmall, color = CompassColors.Error)
+                    }
+                }
             }
 
-            // ── LOGOUT ────────────────────────────────────────────────
             Spacer(Modifier.height(8.dp))
             TextButton(
                 onClick = { viewModel.logout(); onLogout() },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                 colors = ButtonDefaults.textButtonColors(contentColor = CompassColors.Error)
             ) {
                 Icon(Icons.AutoMirrored.Filled.Logout, null)
@@ -191,117 +250,105 @@ fun SettingsScreen(
         }
     }
 
-    // ── API KEY DIALOG ────────────────────────────────────────────
-    if (showApiKeyDialog) {
-        var keyInput by remember { mutableStateOf(apiKey ?: "") }
-        var showKey  by remember { mutableStateOf(false) }
+    if (showApiDlg) {
+        var k by remember { mutableStateOf(apiKey ?: "") }
+        var show by remember { mutableStateOf(false) }
         AlertDialog(
-            onDismissRequest = { showApiKeyDialog = false },
-            title = { Text("Anthropic API Key") },
+            onDismissRequest = { showApiDlg = false },
+            title = { Text("Gemini API Key") },
             text = {
                 Column {
-                    Text("Enter your API key from console.anthropic.com",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Get your free key from aistudio.google.com/apikey", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(k, { k = it }, Modifier.fillMaxWidth(), placeholder = { Text("AIza…") }, singleLine = true,
+                        visualTransformation = if (show) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = { IconButton({ show = !show }) { Icon(if (show) Icons.Default.VisibilityOff else Icons.Default.Visibility, null) } })
+                }
+            },
+            confirmButton = { TextButton({ viewModel.setApiKey(k.trim()); showApiDlg = false }) { Text("Save") } },
+            dismissButton = { TextButton({ showApiDlg = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showPasswordDlg) {
+        var input by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showPasswordDlg = false; passwordError = false },
+            title = { Text("Enter password") },
+            text = {
+                Column {
                     OutlinedTextField(
-                        value = keyInput,
-                        onValueChange = { keyInput = it },
-                        placeholder = { Text("sk-ant-…") },
+                        value = input,
+                        onValueChange = { input = it; passwordError = false },
+                        visualTransformation = PasswordVisualTransformation(),
+                        isError = passwordError,
+                        supportingText = { if (passwordError) Text("Incorrect password") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { showKey = !showKey }) {
-                                Icon(if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility, null)
-                            }
-                        }
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    viewModel.setApiKey(keyInput.trim())
-                    showApiKeyDialog = false
-                }) { Text("Save") }
+                    if (viewModel.checkMasterPassword(input)) {
+                        showPasswordDlg = false
+                        showMasterDlg = true
+                    } else {
+                        passwordError = true
+                    }
+                }) { Text("Continue") }
             },
-            dismissButton = {
-                TextButton(onClick = { showApiKeyDialog = false }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton({ showPasswordDlg = false; passwordError = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showMasterDlg) {
+        AlertDialog(
+            onDismissRequest = { showMasterDlg = false },
+            icon = { Icon(Icons.Default.Warning, null, tint = CompassColors.Error) },
+            title = { Text("Master Control") },
+            text = {
+                Text(
+                    if (masterOn)
+                        "Master Control is currently ON. Turning it off restores normal rules — nothing already changed will be undone."
+                    else
+                        "Turning this on unlocks editing and deleting for notes, songs, voice messages, and photos across every signed-in device. Turn it off any time to go back to normal."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { viewModel.setMasterControl(!masterOn); showMasterDlg = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = if (masterOn) CompassColors.Success else CompassColors.Error)
+                ) { Text(if (masterOn) "Turn OFF" else "Turn ON") }
+            },
+            dismissButton = { TextButton({ showMasterDlg = false }) { Text("Cancel") } }
         )
     }
 }
 
 @Composable
-private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Column(modifier = Modifier.padding(vertical = 4.dp)) {
-        Text(
-            title,
-            style = MaterialTheme.typography.labelMedium,
-            color = CompassColors.Blue400,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-        )
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 0.dp)
-        ) {
+private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Text(title, style = MaterialTheme.typography.labelMedium, color = CompassColors.Blue400,
+            fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
             Column(content = content)
         }
     }
 }
 
 @Composable
-private fun SettingsRow(
-    icon: ImageVector,
-    title: String,
-    subtitle: String? = null,
-    onClick: (() -> Unit)? = null,
-    trailing: @Composable (() -> Unit)? = null
-) {
-    val modifier = if (onClick != null)
-        Modifier.fillMaxWidth().clickable(onClick = onClick)
-    else
-        Modifier.fillMaxWidth()
-
-    Row(
-        modifier = modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(icon, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
+private fun SRow(icon: ImageVector, title: String, subtitle: String? = null, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, Modifier.size(22.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.width(16.dp))
-        Column(modifier = Modifier.weight(1f)) {
+        Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-            if (subtitle != null) {
-                Text(subtitle, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            if (subtitle != null) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (trailing != null) trailing()
-        else if (onClick != null) {
-            Icon(Icons.Default.ChevronRight, null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
-        }
+        Icon(Icons.Default.ChevronRight, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
-@Composable
-private fun AccountRow(email: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(Icons.Default.AccountCircle, null, modifier = Modifier.size(40.dp), tint = CompassColors.Blue400)
-        Spacer(Modifier.width(16.dp))
-        Column {
-            Text("Google Account", style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(email, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-        }
-    }
-}
-
-@Composable
-private fun SettingsDivider() {
-    HorizontalDivider(modifier = Modifier.padding(start = 54.dp))
-}
+@Composable private fun Div() = HorizontalDivider(Modifier.padding(start = 54.dp))

@@ -17,7 +17,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 import javax.inject.Inject
 
-enum class ExportType { NOTES, SONGS, VOICE, ONE_DAY, FULL }
+enum class ExportType { NOTES, SONGS, VOICE, PHOTOS, ONE_DAY, FULL }
 
 @HiltViewModel
 class ExportViewModel @Inject constructor(
@@ -48,17 +48,23 @@ class ExportViewModel @Inject constructor(
             ExportType.NOTES  -> "compass_notes_$stamp.zip"
             ExportType.SONGS  -> "compass_songs_$stamp.zip"
             ExportType.VOICE  -> "compass_voice_$stamp.zip"
+            ExportType.PHOTOS -> "compass_photos_$stamp.zip"
             ExportType.ONE_DAY -> "compass_day_${day ?: LocalDate.now()}.zip"
             ExportType.FULL   -> "compass_full_backup_$stamp.zip"
         }
     }
 
-    fun exportNotes(from: LocalDate?, to: LocalDate?) = run {
+    fun exportNotes(from: LocalDate?, to: LocalDate?) {
         viewModelScope.launch {
             _isExporting.value = true; _status.value = "Preparing…"
             val filtered = repo.getAllNotesForBackup().filter { inRange(localDateOf(it.sentAt), from, to) }
+            val moods = repo.getAllMoodForBackup().filter {
+                val d = runCatching { LocalDate.parse(it.dateKey) }.getOrNull()
+                d != null && inRange(d, from, to)
+            }
             val workDir = freshWorkDir()
             File(workDir, "notes.csv").writeText(ExportManager.notesCsv(filtered))
+            File(workDir, "mood.csv").writeText(ExportManager.moodCsv(moods))
             finishZip(workDir, "notes")
         }
     }
@@ -90,6 +96,28 @@ class ExportViewModel @Inject constructor(
         }
     }
 
+    /** Exports only photos — every photo in range, including a replaced/hidden one,
+     *  since "hidden from the app view" never meant "deleted" for these. Filter is
+     *  the same date-range system as Notes/Songs/Voice. */
+    fun exportPhotos(from: LocalDate?, to: LocalDate?) {
+        viewModelScope.launch {
+            _isExporting.value = true; _status.value = "Preparing…"
+            val filtered = repo.getAllPhotosForBackup().filter {
+                val d = runCatching { LocalDate.parse(it.dateKey) }.getOrNull()
+                d != null && inRange(d, from, to)
+            }
+            val workDir = freshWorkDir()
+            File(workDir, "photos_manifest.csv").writeText(ExportManager.photosManifestCsv(filtered))
+            val photosSrcDir = File(context.filesDir, "photos")
+            val outPhotosDir = File(workDir, "photos").apply { mkdirs() }
+            filtered.forEach { p ->
+                val src = File(photosSrcDir, p.fileName)
+                if (src.exists()) src.copyTo(File(outPhotosDir, p.fileName), overwrite = true)
+            }
+            finishZip(workDir, "photos")
+        }
+    }
+
     fun exportOneDay(day: LocalDate) {
         viewModelScope.launch {
             _isExporting.value = true; _status.value = "Preparing…"
@@ -98,11 +126,13 @@ class ExportViewModel @Inject constructor(
             val songs  = repo.getAllSongsForBackup().filter { localDateOf(it.sentAt) == day }
             val voice  = repo.getAllVoiceForBackup().filter { localDateOf(it.sentAt) == day }
             val photos = repo.getAllPhotosForBackup().filter { it.dateKey == dateKey }
+            val mood   = repo.getAllMoodForBackup().filter { it.dateKey == dateKey }
 
             val workDir = freshWorkDir()
             File(workDir, "notes.csv").writeText(ExportManager.notesCsv(notes))
             File(workDir, "songs.csv").writeText(ExportManager.songsCsv(songs))
             File(workDir, "voice_manifest.csv").writeText(ExportManager.voiceManifestCsv(voice))
+            File(workDir, "mood.csv").writeText(ExportManager.moodCsv(mood))
 
             val voiceSrcDir = File(context.filesDir, "voice")
             val outVoiceDir = File(workDir, "voice").apply { mkdirs() }
@@ -111,6 +141,8 @@ class ExportViewModel @Inject constructor(
                 if (src.exists()) src.copyTo(File(outVoiceDir, v.audioFileName), overwrite = true)
             }
 
+            // Both photos for the day are included here, even the "hidden" one — this
+            // export is the one deliberate way to see a replaced/hidden photo again.
             val photosSrcDir = File(context.filesDir, "photos")
             val outPhotosDir = File(workDir, "photos").apply { mkdirs() }
             photos.forEach { p ->
@@ -132,9 +164,14 @@ class ExportViewModel @Inject constructor(
                 val d = runCatching { LocalDate.parse(it.dateKey) }.getOrNull()
                 d != null && inRange(d, from, to)
             }
+            val moods = repo.getAllMoodForBackup().filter {
+                val d = runCatching { LocalDate.parse(it.dateKey) }.getOrNull()
+                d != null && inRange(d, from, to)
+            }
 
             val allDates = (notes.map { it.dateKey } + songs.map { localDateOf(it.sentAt).toString() } +
-                    voice.map { localDateOf(it.sentAt).toString() } + photos.map { it.dateKey }).toSortedSet()
+                    voice.map { localDateOf(it.sentAt).toString() } + photos.map { it.dateKey } +
+                    moods.map { it.dateKey }).toSortedSet()
 
             val workDir = freshWorkDir()
             val voiceSrcDir = File(context.filesDir, "voice")
@@ -146,6 +183,7 @@ class ExportViewModel @Inject constructor(
 
                 File(dayDir, "notes.csv").writeText(ExportManager.notesCsv(notes.filter { it.dateKey == dateKey }))
                 File(dayDir, "songs.csv").writeText(ExportManager.songsCsv(songs.filter { dayDate != null && localDateOf(it.sentAt) == dayDate }))
+                File(dayDir, "mood.csv").writeText(ExportManager.moodCsv(moods.filter { it.dateKey == dateKey }))
                 val dayVoice = voice.filter { dayDate != null && localDateOf(it.sentAt) == dayDate }
                 File(dayDir, "voice_manifest.csv").writeText(ExportManager.voiceManifestCsv(dayVoice))
                 val outVoiceDir = File(dayDir, "voice").apply { mkdirs() }

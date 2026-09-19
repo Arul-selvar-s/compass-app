@@ -1,14 +1,11 @@
 package com.compass.diary.data.local.database
 
+import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import androidx.room.TypeConverters
-import android.content.Context
 import com.compass.diary.data.local.dao.*
 import com.compass.diary.data.local.entity.*
-import net.sqlcipher.database.SQLiteDatabase
-import net.sqlcipher.database.SupportFactory
 
 @Database(
     entities = [
@@ -16,35 +13,33 @@ import net.sqlcipher.database.SupportFactory
         StarredItemEntity::class,
         ReminderEntity::class,
         VersionHistoryEntity::class,
-        SharedPageEntity::class,
         DrawingEntity::class,
-        VoiceNoteEntity::class
+        SongMessageEntity::class,
+        VoiceMessageEntity::class,
+        NoteMessageEntity::class,
+        PhotoEntity::class,
+        MoodEntity::class
     ],
-    version = 1,
-    exportSchema = true
+    version = 6,
+    exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
-
     abstract fun diaryDao(): DiaryDao
     abstract fun starredDao(): StarredDao
     abstract fun reminderDao(): ReminderDao
     abstract fun versionHistoryDao(): VersionHistoryDao
     abstract fun drawingDao(): DrawingDao
-    abstract fun voiceNoteDao(): VoiceNoteDao
+    abstract fun songDao(): SongDao
+    abstract fun voiceMessageDao(): VoiceMessageDao
+    abstract fun noteDao(): NoteDao
+    abstract fun photoDao(): PhotoDao
+    abstract fun moodDao(): MoodDao
 
     companion object {
-        const val DATABASE_NAME = "compass_diary.db"
-
-        fun create(context: Context, passphrase: ByteArray): AppDatabase {
-            val factory = SupportFactory(passphrase)
-            return Room.databaseBuilder(
-                context.applicationContext,
-                AppDatabase::class.java,
-                DATABASE_NAME
-            )
-                .openHelperFactory(factory)
-                .fallbackToDestructiveMigrationOnDowngrade()
+        fun create(context: Context): AppDatabase =
+            Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, "compass_diary.db")
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .fallbackToDestructiveMigration()
                 .build()
-        }
     }
 }

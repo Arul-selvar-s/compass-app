@@ -4,7 +4,6 @@ import com.compass.diary.data.local.dao.*
 import com.compass.diary.data.local.entity.*
 import kotlinx.coroutines.flow.Flow
 import java.time.LocalDate
-import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Locale
 import javax.inject.Inject
@@ -17,145 +16,197 @@ class DiaryRepository @Inject constructor(
     private val reminderDao: ReminderDao,
     private val versionHistoryDao: VersionHistoryDao,
     private val drawingDao: DrawingDao,
-    private val voiceNoteDao: VoiceNoteDao
+    private val songDao: SongDao,
+    private val voiceMessageDao: VoiceMessageDao,
+    private val noteDao: NoteDao,
+    private val photoDao: PhotoDao,
+    private val moodDao: MoodDao
 ) {
-    // ─── DIARY ENTRIES ────────────────────────────────────────────
-
     fun getAllEntries(): Flow<List<DiaryEntryEntity>> = diaryDao.getAllEntries()
-
-    fun getEntryByDate(dateKey: String): Flow<DiaryEntryEntity?> =
-        diaryDao.getEntryByDate(dateKey)
-
+    fun getEntryByDate(dateKey: String): Flow<DiaryEntryEntity?> = diaryDao.getEntryByDate(dateKey)
     fun getAllDateKeys(): Flow<List<String>> = diaryDao.getAllDateKeys()
+    suspend fun getEntryByDateOnce(dateKey: String) = diaryDao.getEntryByDateOnce(dateKey)
+    suspend fun getAllForBackup() = diaryDao.getAllForBackup()
 
-    /** Returns today's entry, creating it if it doesn't exist. */
-    suspend fun getOrCreateTodayEntry(): DiaryEntryEntity {
-        val today = LocalDate.now()
-        val key = today.format(DateTimeFormatter.ISO_LOCAL_DATE)
-        val existing = diaryDao.getEntryByDateOnce(key)
-        if (existing != null) return existing
-        val title = buildTitle(today)
-        val newEntry = DiaryEntryEntity(dateKey = key, title = title)
-        diaryDao.upsertEntry(newEntry)
-        return newEntry
-    }
-
-    suspend fun saveContent(dateKey: String, contentJson: String, plainText: String) {
-        val wordCount = plainText.split(Regex("\\s+")).filter { it.isNotBlank() }.size
-        diaryDao.updateContent(dateKey, contentJson, plainText, wordCount)
-        // Save to version history
-        versionHistoryDao.insertVersion(
-            VersionHistoryEntity(
-                diaryDateKey = dateKey,
-                contentJson = contentJson,
-                plainText = plainText,
-                wordCount = wordCount,
-                changeDescription = "Auto-saved"
-            )
-        )
-        pruneVersionHistory(dateKey)
-    }
-
-    suspend fun searchEntries(query: String): List<DiaryEntryEntity> =
-        diaryDao.searchEntries(query)
-
-    suspend fun getEntriesInRange(from: String, to: String): List<DiaryEntryEntity> =
-        diaryDao.getEntriesInRange(from, to)
-
-    suspend fun softDeleteEntry(dateKey: String) = diaryDao.softDelete(dateKey)
-
-    suspend fun getUnsyncedEntries() = diaryDao.getUnsyncedEntries()
-
-    suspend fun markEntrySynced(dateKey: String, cloudId: String) =
-        diaryDao.markSynced(dateKey, cloudId)
-
-    // ─── VERSION HISTORY ──────────────────────────────────────────
-
-    fun getVersionHistory(dateKey: String): Flow<List<VersionHistoryEntity>> =
-        versionHistoryDao.getHistoryForDate(dateKey)
-
-    suspend fun getVersionHistoryLimited(dateKey: String, limit: Int = 30) =
-        versionHistoryDao.getHistoryForDateLimited(dateKey, limit)
-
-    suspend fun restoreVersion(dateKey: String, version: VersionHistoryEntity) {
-        diaryDao.updateContent(
-            dateKey,
-            version.contentJson,
-            version.plainText,
-            version.wordCount
-        )
-        versionHistoryDao.insertVersion(
-            version.copy(
-                id = 0,
-                changeDescription = "Restored version from ${version.savedAt}"
-            )
-        )
-    }
-
-    private suspend fun pruneVersionHistory(dateKey: String) {
-        val count = versionHistoryDao.countVersions(dateKey)
-        if (count > 100) {
-            // Keep only the last 100 versions; prune the oldest
-            val cutoff = System.currentTimeMillis() - (30L * 24 * 60 * 60 * 1000) // 30 days
-            versionHistoryDao.pruneOldVersions(dateKey, cutoff)
+    suspend fun ensureEntry(dateKey: String) {
+        if (diaryDao.getEntryByDateOnce(dateKey) == null) {
+            val date = runCatching { LocalDate.parse(dateKey) }.getOrDefault(LocalDate.now())
+            diaryDao.upsertEntry(DiaryEntryEntity(dateKey = dateKey, title = buildTitle(date)))
         }
     }
 
-    // ─── STARRED ITEMS ────────────────────────────────────────────
+    fun getNoteMessages(dateKey: String): Flow<List<NoteMessageEntity>> = noteDao.getMessagesForDate(dateKey)
+    suspend fun getAllNotesForBackup() = noteDao.getAllForBackup()
+
+    suspend fun addNoteMessage(dateKey: String, text: String, sentAt: Long = System.currentTimeMillis()) {
+        val clean = text.trim()
+        if (clean.isBlank()) return
+        ensureEntry(dateKey)
+        noteDao.insertMessage(NoteMessageEntity(dateKey = dateKey, text = clean, sentAt = sentAt))
+        resyncDaySummary(dateKey)
+    }
+
+    // ── Master Control only — normal flow never calls these ──────
+    suspend fun editNoteMessage(id: Long, dateKey: String, newText: String) {
+        noteDao.updateText(id, newText.trim())
+        resyncDaySummary(dateKey)
+    }
+
+    suspend fun deleteNoteMessage(id: Long, dateKey: String) {
+        noteDao.deleteById(id)
+        resyncDaySummary(dateKey)
+    }
+
+    suspend fun editSong(id: Long, url: String, note: String?) = songDao.update(id, url.trim(), note?.trim()?.takeIf { it.isNotBlank() })
+    suspend fun deleteSong(id: Long) = songDao.deleteById(id)
+
+    suspend fun editVoiceNote(id: Long, note: String?) = voiceMessageDao.updateNote(id, note?.trim()?.takeIf { it.isNotBlank() })
+    suspend fun getVoiceById(id: Long) = voiceMessageDao.getById(id)
+    suspend fun deleteVoice(id: Long) = voiceMessageDao.deleteById(id)
+
+    suspend fun getPhotoById(id: Long) = photoDao.getById(id)
+    suspend fun deletePhoto(id: Long) = photoDao.deleteById(id)
+    // ───────────────────────────────────────────────────────────
+
+    suspend fun mergeNotesFromBackup(items: List<NoteMessageEntity>) {
+        val affectedDates = mutableSetOf<String>()
+        items.forEach { remote ->
+            val existing = noteDao.findMatch(remote.dateKey, remote.text, remote.sentAt)
+            if (existing == null) {
+                noteDao.insertMessage(remote)
+                affectedDates += remote.dateKey
+            }
+        }
+        affectedDates.forEach { resyncDaySummary(it) }
+    }
+
+    private suspend fun resyncDaySummary(dateKey: String) {
+        val all = noteDao.getMessagesForDateOnce(dateKey)
+        val combined = all.joinToString("\n\n") { it.text }
+        val wc = combined.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+        diaryDao.updateContent(dateKey, combined, combined, wc)
+    }
+
+    suspend fun autoLockPastEntries() {
+        // No-op under the chat model — every note message is immutable on send
+        // unless Master Control is on.
+    }
+
+    suspend fun starWholeDay(dateKey: String) {
+        val entry = diaryDao.getEntryByDateOnce(dateKey) ?: return
+        if (entry.plainText.isBlank()) return
+        starredDao.insertStarred(
+            StarredItemEntity(
+                diaryDateKey = dateKey,
+                contentType  = "DAY",
+                contentJson  = entry.contentJson,
+                preview      = entry.plainText.take(80)
+            )
+        )
+    }
+
+    suspend fun mergeFromBackup(entries: List<DiaryEntryEntity>) {
+        entries.forEach { remote ->
+            val local = diaryDao.getEntryByDateOnce(remote.dateKey)
+            if (local == null || remote.updatedAt > local.updatedAt) {
+                diaryDao.upsertEntry(remote)
+            }
+        }
+    }
+
+    suspend fun getAllStarredForBackup() = starredDao.getAllStarredForBackup()
+
+    suspend fun mergeStarredFromBackup(items: List<StarredItemEntity>) {
+        items.forEach { remote ->
+            val existing = starredDao.findMatch(remote.diaryDateKey, remote.contentJson)
+            if (existing == null) starredDao.insertStarred(remote.copy(id = 0))
+        }
+    }
+
+    fun getAllSongs(): Flow<List<SongMessageEntity>> = songDao.getAllSongs()
+    suspend fun getAllSongsForBackup() = songDao.getAllSongsForBackup()
+    suspend fun addSong(song: SongMessageEntity): Long = songDao.insertSong(song)
+    suspend fun setSongTitle(id: Long, title: String) = songDao.updateTitle(id, title)
+
+    suspend fun mergeSongsFromBackup(items: List<SongMessageEntity>) {
+        items.forEach { remote ->
+            val existing = songDao.findMatch(remote.youtubeUrl, remote.sender, remote.sentAt)
+            if (existing == null) songDao.insertSong(remote)
+        }
+    }
+
+    fun getAllVoiceMessages(): Flow<List<VoiceMessageEntity>> = voiceMessageDao.getAllVoiceMessages()
+    suspend fun getAllVoiceForBackup() = voiceMessageDao.getAllForBackup()
+    suspend fun addVoiceMessage(v: VoiceMessageEntity): Long = voiceMessageDao.insertVoice(v)
+
+    suspend fun mergeVoiceFromBackup(items: List<VoiceMessageEntity>) {
+        items.forEach { remote ->
+            val existing = voiceMessageDao.findMatch(remote.audioFileName)
+            if (existing == null) voiceMessageDao.insertVoice(remote)
+        }
+    }
+
+    fun getPhotosForDate(dateKey: String): Flow<List<PhotoEntity>> = photoDao.getPhotosForDate(dateKey)
+    suspend fun getPhotosForDateOnce(dateKey: String) = photoDao.getPhotosForDateOnce(dateKey)
+    fun getAllPhotos(): Flow<List<PhotoEntity>> = photoDao.getAllPhotos()
+    suspend fun getAllPhotosForBackup() = photoDao.getAllForBackup()
+    suspend fun addPhoto(p: PhotoEntity): Long = photoDao.insertPhoto(p)
+    suspend fun setPhotoDriveFileId(id: Long, fileId: String) = photoDao.setDriveFileId(id, fileId)
+
+    suspend fun mergePhotosFromBackup(items: List<PhotoEntity>): List<PhotoEntity> {
+        val needDownload = mutableListOf<PhotoEntity>()
+        items.forEach { remote ->
+            val existing = photoDao.findMatch(remote.dateKey, remote.fileName)
+            if (existing == null) {
+                photoDao.insertPhoto(remote)
+                needDownload += remote
+            } else if (existing.driveFileId == null && remote.driveFileId != null) {
+                photoDao.setDriveFileId(existing.id, remote.driveFileId)
+                needDownload += remote.copy(id = existing.id)
+            }
+        }
+        return needDownload
+    }
+
+    fun getMoodForDate(dateKey: String): Flow<MoodEntity?> = moodDao.getForDate(dateKey)
+    suspend fun getMoodForDateOnce(dateKey: String) = moodDao.getForDateOnce(dateKey)
+    suspend fun getAllMoodForBackup() = moodDao.getAllForBackup()
+
+    suspend fun saveMood(dateKey: String, missedPercent: Int, lovedPercent: Int): Boolean {
+        if (moodDao.getForDateOnce(dateKey) != null) return false
+        return try {
+            moodDao.insert(MoodEntity(dateKey = dateKey, missedPercent = missedPercent, lovedPercent = lovedPercent))
+            true
+        } catch (e: Exception) { false }
+    }
+
+    suspend fun mergeMoodFromBackup(items: List<MoodEntity>) {
+        items.forEach { remote ->
+            if (moodDao.getForDateOnce(remote.dateKey) == null) {
+                try { moodDao.insert(remote) } catch (e: Exception) { /* already exists, ignore */ }
+            }
+        }
+    }
+
+    suspend fun searchEntries(q: String) = diaryDao.searchEntries(q)
 
     fun getAllStarred(): Flow<List<StarredItemEntity>> = starredDao.getAllStarred()
-
-    fun getStarredForDate(dateKey: String): Flow<List<StarredItemEntity>> =
-        starredDao.getStarredForDate(dateKey)
-
     suspend fun addStarred(item: StarredItemEntity): Long = starredDao.insertStarred(item)
-
     suspend fun removeStarred(id: Long) = starredDao.deleteStarredById(id)
 
-    suspend fun searchStarred(query: String) = starredDao.searchStarred(query)
-
-    // ─── REMINDERS ────────────────────────────────────────────────
-
-    fun getAllReminders(): Flow<List<ReminderEntity>> = reminderDao.getAllReminders()
-
-    fun getUpcomingReminders(): Flow<List<ReminderEntity>> = reminderDao.getUpcomingReminders()
-
-    fun getCompletedReminders(): Flow<List<ReminderEntity>> = reminderDao.getCompletedReminders()
-
-    suspend fun upsertReminder(reminder: ReminderEntity): Long =
-        reminderDao.upsertReminder(reminder)
-
-    suspend fun deleteReminder(reminder: ReminderEntity) = reminderDao.deleteReminder(reminder)
-
+    fun getUpcomingReminders() = reminderDao.getUpcomingReminders()
+    fun getCompletedReminders() = reminderDao.getCompletedReminders()
+    suspend fun upsertReminder(r: ReminderEntity): Long = reminderDao.upsertReminder(r)
+    suspend fun deleteReminder(r: ReminderEntity) = reminderDao.deleteReminder(r)
     suspend fun markReminderCompleted(id: Long) = reminderDao.markCompleted(id)
 
-    suspend fun getReminderById(id: Long) = reminderDao.getReminderById(id)
+    fun getVersionHistory(dateKey: String) = versionHistoryDao.getHistoryForDate(dateKey)
 
-    // ─── DRAWINGS ─────────────────────────────────────────────────
-
-    fun getDrawings(dateKey: String): Flow<List<DrawingEntity>> =
-        drawingDao.getDrawingsForDate(dateKey)
-
-    suspend fun saveDrawing(drawing: DrawingEntity): Long = drawingDao.upsertDrawing(drawing)
-
-    suspend fun deleteDrawing(drawing: DrawingEntity) = drawingDao.deleteDrawing(drawing)
-
-    // ─── VOICE NOTES ──────────────────────────────────────────────
-
-    fun getVoiceNotes(dateKey: String): Flow<List<VoiceNoteEntity>> =
-        voiceNoteDao.getVoiceNotesForDate(dateKey)
-
-    suspend fun saveVoiceNote(note: VoiceNoteEntity): Long = voiceNoteDao.upsertVoiceNote(note)
-
-    suspend fun deleteVoiceNote(note: VoiceNoteEntity) = voiceNoteDao.deleteVoiceNote(note)
-
-    suspend fun searchTranscripts(query: String) = voiceNoteDao.searchTranscripts(query)
-
-    // ─── HELPERS ──────────────────────────────────────────────────
+    suspend fun saveDrawing(d: DrawingEntity): Long = drawingDao.upsertDrawing(d)
 
     private fun buildTitle(date: LocalDate): String {
         val dow = date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.getDefault())
-        val month = date.month.getDisplayName(TextStyle.FULL, Locale.getDefault())
-        return "$dow, $month ${date.dayOfMonth}, ${date.year}"
+        val mon = date.month.getDisplayName(TextStyle.FULL, Locale.getDefault())
+        return "$dow, $mon ${date.dayOfMonth}, ${date.year}"
     }
 }

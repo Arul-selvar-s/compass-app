@@ -4,8 +4,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -19,86 +18,50 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.compass.diary.ui.theme.CompassColors
 import com.compass.diary.viewmodel.SplashViewModel
 import kotlinx.coroutines.delay
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 
 @Composable
 fun SplashScreen(
-    onNavigateToSetup: () -> Unit,
-    onNavigateToCompass: () -> Unit,
+    onSetup: () -> Unit,
+    onCompass: () -> Unit,
     viewModel: SplashViewModel = hiltViewModel()
 ) {
-    val isSetupComplete by viewModel.isSetupComplete.collectAsState(initial = false)
+    val setupDone by viewModel.isSetupComplete.collectAsState()
+    var show by remember { mutableStateOf(false) }
 
-    // Needle spin-up animation
-    val needleAnim = rememberInfiniteTransition(label = "needle_spin")
-    val needleRotation by needleAnim.animateFloat(
-        initialValue = 0f, targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1200, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "needleRot"
+    val spin = rememberInfiniteTransition(label = "spin")
+    val rot by spin.animateFloat(
+        0f, 360f,
+        infiniteRepeatable(tween(2000, easing = LinearEasing)),
+        label = "rot"
     )
 
-    // Text fade-in
-    var titleVisible by remember { mutableStateOf(false) }
-    var subtitleVisible by remember { mutableStateOf(false) }
-
     LaunchedEffect(Unit) {
-        delay(400)
-        titleVisible = true
-        delay(600)
-        subtitleVisible = true
+        delay(300); show = true
         delay(1800)
-        if (isSetupComplete) onNavigateToCompass() else onNavigateToSetup()
+        if (setupDone) onCompass() else onSetup()
     }
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(colors = listOf(Color(0xFF060C1A), Color(0xFF0D1B3E)))
-            ),
+        modifier = Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(0xFF060C1A), Color(0xFF0D2047)))
+        ),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-
-            // Compass icon (drawn with Text emoji for now; replace with vector asset)
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(120.dp)) {
-                Text(text = "🧭", fontSize = 80.sp, modifier = Modifier.rotate(needleRotation * 0.1f))
-            }
-
+            Text("🧭", fontSize = 80.sp, modifier = Modifier.rotate(rot * 0.05f))
             Spacer(Modifier.height(32.dp))
-
-            AnimatedVisibility(
-                visible = titleVisible,
-                enter = fadeIn(tween(600)) + slideInVertically { it / 2 }
-            ) {
-                Text(
-                    text = "COMPASS",
-                    style = MaterialTheme.typography.displaySmall,
-                    fontWeight = FontWeight.Bold,
-                    color = CompassColors.White,
-                    letterSpacing = 8.sp
-                )
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            AnimatedVisibility(
-                visible = subtitleVisible,
-                enter = fadeIn(tween(600))
-            ) {
-                Text(
-                    text = "Your private journal",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = CompassColors.Silver400,
-                    letterSpacing = 2.sp
-                )
+            AnimatedVisibility(show, enter = fadeIn(tween(600)) + slideInVertically { it / 2 }) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("COMPASS", style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.Bold, color = CompassColors.White, letterSpacing = 6.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Go Where Your Heart Desire", style = MaterialTheme.typography.bodyMedium,
+                        color = CompassColors.Silver400, letterSpacing = 2.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text("The Moon is beautiful, isn't it?", style = MaterialTheme.typography.bodyMedium,
+                        color = CompassColors.Silver400, letterSpacing = 2.sp)
+                    
+                }
             }
         }
     }
